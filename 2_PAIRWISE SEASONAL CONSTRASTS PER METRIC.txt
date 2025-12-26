@@ -1,0 +1,477 @@
+# =============================================================================
+# Author: Eudriano Costa
+# Date: 2025
+# 
+# FINAL PUBLICATION SCRIPT (Tables + Plots)
+# Consistent with the null-model generator shown (seasons simulated independently).
+#
+# Outputs:
+#  - Table 1 (GT): pairwise seasonal contrasts per metric with bootstrap CI/p,
+#    multiplicity correction across 18 tests, and magnitude (d_pooled).
+#  - Figure (A–C): half-eye density of Δ draws (independent seasonal null draws),
+#    dot = mean difference, thick line = IQR of Δ draws, thin line = 95% CI for mean diff,
+#    * = multiplicity-adjusted support, label = d_pooled.
+#
+# Key point:
+#  - Seasons are independent in the generator; therefore Δ is built from
+#    independent draws between seasonal null distributions (NOT paired by Simulation ID).
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(ggplot2)
+  library(ggdist)
+  library(patchwork)
+  library(gt)
+  library(scales)
+  library(readr)
+})
+
+# -----------------------------------------------------------------------------
+# USER SETTINGS
+# -----------------------------------------------------------------------------
+metrics   <- c("FRic", "FEve", "FDiv")
+season_order <- c("Summer", "Autumn", "Winter", "Spring")
+
+# Pair list (6 comparisons)
+pairs <- list(
+  c("Summer","Autumn"),
+  c("Summer","Winter"),
+  c("Summer","Spring"),
+  c("Autumn","Winter"),
+  c("Autumn","Spring"),
+  c("Winter","Spring")
+)
+
+# Inference + visualization settings
+set.seed(123)
+alpha    <- 0.05
+eps      <- 1e-12      # tolerance to avoid floating sign artifacts around 0
+B_boot   <- 2000       # bootstrap resamples for mean difference CI/p
+n_delta  <- 8000       # number of Δ draws for density + IQR (independent draws)
+p_adjust <- "holm"     # "holm" (FWER) or "BH" (FDR)
+
+# Output folders (Windows paths)
+fig_dir <- "C:/Users/eudriano/Documents/efc/R_Stat/2026_Trait_bycatch/FD_Analysis/Figures"
+tab_dir <- "C:/Users/eudriano/Documents/efc/R_Stat/2026_Trait_bycatch/FD_Analysis/Tables"
+if(!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+if(!dir.exists(tab_dir)) dir.create(tab_dir, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# THEME (fallback if FD_theme2() does not exist)
+# -----------------------------------------------------------------------------
+if(!exists("FD_theme2", mode = "function")) {
+  FD_theme2 <- function() {
+    theme_bw(base_size = 12) +
+      theme(
+        panel.grid = element_blank(),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(face = "bold"),
+        strip.background = element_rect(fill = "grey95", color = NA)
+      )
+  }
+}
+
+# -----------------------------------------------------------------------------
+# INPUT CHECKS
+# -----------------------------------------------------------------------------
+stopifnot(exists("null_data"))
+stopifnot(all(c("Season") %in% names(null_data)))
+stopifnot(all(metrics %in% names(null_data)))
+
+null_data <- null_data %>%
+  dplyr::mutate(
+    Season = factor(Season, levels = season_order, ordered = TRUE)
+  )
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+y_labs <- c(
+  "Winter vs Spring" = "Spring − Winter",
+  "Autumn vs Spring" = "Spring − Autumn",
+  "Autumn vs Winter" = "Winter − Autumn",
+  "Summer vs Spring" = "Spring − Summer",
+  "Summer vs Winter" = "Winter − Summer",
+  "Summer vs Autumn" = "Autumn − Summer"
+)
+
+effect_class <- function(d_abs) {
+  dplyr::case_when(
+    is.na(d_abs) ~ NA_character_,
+    d_abs < 0.20 ~ "Negligible",
+    d_abs < 0.50 ~ "Small",
+    d_abs < 0.80 ~ "Medium",
+    d_abs < 1.30 ~ "Large",
+    TRUE         ~ "Very large"
+  )
+}
+
+overlap_coeff_kde <- function(x, y, n = 512) {
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  if(length(x) < 2 || length(y) < 2) return(NA_real_)
+  rng <- range(c(x, y))
+  d1 <- stats::density(x, from = rng[1], to = rng[2], n = n)
+  d2 <- stats::density(y, from = rng[1], to = rng[2], n = n)
+  dx <- d1$x[2] - d1$x[1]
+  sum(pmin(d1$y, d2$y)) * dx
+}
+
+wasserstein1_equaln <- function(x, y) {
+  x <- x[is.finite(x)]; y <- y[is.finite(y)]
+  n <- min(length(x), length(y))
+  if(n < 2) return(NA_real_)
+  x <- sort(x)[seq_len(n)]
+  y <- sort(y)[seq_len(n)]
+  mean(abs(x - y))
+}
+
+cohen_d_pooled <- function(df, metric, s1, s2) {
+  x1 <- df[[metric]][df$Season == s1]; x1 <- x1[is.finite(x1)]
+  x2 <- df[[metric]][df$Season == s2]; x2 <- x2[is.finite(x2)]
+  n1 <- length(x1); n2 <- length(x2)
+  if(n1 < 2 || n2 < 2) return(NA_real_)
+  m1 <- mean(x1); m2 <- mean(x2)
+  v1 <- stats::var(x1); v2 <- stats::var(x2)
+  sp <- sqrt(((n1 - 1)*v1 + (n2 - 1)*v2) / (n1 + n2 - 2))
+  if(!is.finite(sp) || sp == 0) return(NA_real_)
+  (m2 - m1) / sp
+}
+
+# Independent Δ draws (proper for independently simulated seasons)
+# Δ_draw = X_draw(Season2) − X_draw(Season1)
+draw_delta <- function(df, metric, s1, s2, n = 8000) {
+  x1 <- df[[metric]][df$Season == s1]; x1 <- x1[is.finite(x1)]
+  x2 <- df[[metric]][df$Season == s2]; x2 <- x2[is.finite(x2)]
+  if(length(x1) < 2 || length(x2) < 2) return(rep(NA_real_, n))
+  sample(x2, size = n, replace = TRUE) - sample(x1, size = n, replace = TRUE)
+}
+
+# Bootstrap for mean difference of null distributions (independent resampling)
+# MeanDiff = mean(Season2) − mean(Season1)
+boot_mean_diff <- function(df, metric, s1, s2, B = 2000) {
+  x1 <- df[[metric]][df$Season == s1]; x1 <- x1[is.finite(x1)]
+  x2 <- df[[metric]][df$Season == s2]; x2 <- x2[is.finite(x2)]
+  n1 <- length(x1); n2 <- length(x2)
+  if(n1 < 5 || n2 < 5) {
+    return(list(mean = NA_real_, ci_l = NA_real_, ci_u = NA_real_, p = NA_real_))
+  }
+  obs <- mean(x2) - mean(x1)
+  boot <- replicate(B, mean(sample(x2, n2, TRUE)) - mean(sample(x1, n1, TRUE)))
+  ci <- stats::quantile(boot, probs = c(0.025, 0.975), names = FALSE)
+  p_two <- 2 * min(mean(boot <= 0), mean(boot >= 0))
+  list(mean = obs, ci_l = ci[1], ci_u = ci[2], p = min(p_two, 1))
+}
+
+# -----------------------------------------------------------------------------
+# TABLE 1 (Inference + magnitude + similarity diagnostics)
+# -----------------------------------------------------------------------------
+table1_raw <- purrr::map_dfr(metrics, function(met) {
+  purrr::map_dfr(pairs, function(pr) {
+    s1 <- pr[1]; s2 <- pr[2]
+    comp <- paste(s1, "vs", s2)
+    
+    bt <- boot_mean_diff(null_data, met, s1, s2, B = B_boot)
+    
+    x1 <- null_data[[met]][null_data$Season == s1]
+    x2 <- null_data[[met]][null_data$Season == s2]
+    
+    d_pool <- cohen_d_pooled(null_data, met, s1, s2)
+    ov <- overlap_coeff_kde(x1, x2)
+    w1 <- wasserstein1_equaln(x1, x2)
+    ksD <- suppressWarnings(stats::ks.test(x1, x2)$statistic) %>% as.numeric()
+    
+    dplyr::tibble(
+      Metric = met,
+      Comparison = comp,
+      Season1 = s1,
+      Season2 = s2,
+      Mean_Diff = bt$mean,
+      CI_Lower = bt$ci_l,
+      CI_Upper = bt$ci_u,
+      p_boot = bt$p,
+      d_pooled = d_pool,
+      Overlap = ov,
+      KS_D = ksD,
+      Wasserstein1 = w1
+    )
+  })
+})
+
+table1 <- table1_raw %>%
+  dplyr::mutate(
+    p_adj = stats::p.adjust(p_boot, method = p_adjust),
+    Supported_CI = (CI_Lower > 0 + eps) | (CI_Upper < 0 - eps),
+    Supported_primary = ifelse(p_adj < alpha, "Yes", "No"),
+    Direction = dplyr::case_when(
+      Mean_Diff >  0 ~ paste0(Season2, " > ", Season1),
+      Mean_Diff <  0 ~ paste0(Season1, " > ", Season2),
+      TRUE ~ "No difference"
+    ),
+    d_abs = abs(d_pooled),
+    d_class = effect_class(d_abs),
+    CI_95 = sprintf("[%.6g, %.6g]", CI_Lower, CI_Upper),
+    MeanDiff_print = sprintf("%.6g", Mean_Diff),
+    Overlap_Level = dplyr::case_when(
+      is.na(Overlap) ~ NA_character_,
+      Overlap >= 0.8 ~ "Very High",
+      Overlap >= 0.7 ~ "High",
+      Overlap >= 0.5 ~ "Moderate",
+      TRUE ~ "Low"
+    )
+  ) %>%
+  dplyr::select(-d_abs)
+
+# Save CSV
+readr::write_csv(table1, file.path(tab_dir, "Table1_pairwise_seasonal_contrasts_independent.csv"))
+
+# GT publication table (ordered FRic, FEve, FDiv)
+# Add overlap gradient color in GT table (0 = low overlap, 1 = high overlap)
+
+table1_gt <- table1 %>%
+  dplyr::mutate(
+    Metric = factor(Metric, levels = c("FRic", "FEve", "FDiv"), ordered = TRUE)
+  ) %>%
+  dplyr::arrange(Metric, Comparison) %>%
+  dplyr::transmute(
+    Metric, Comparison,
+    `Mean Δ` = MeanDiff_print,
+    `95% CI (Mean Δ)` = CI_95,
+    `p (bootstrap)` = p_boot,
+    `p (adjusted)` = p_adj,
+    Supported = Supported_primary,
+    Direction,
+    d_pooled, d_class,
+    Overlap, Overlap_Level, KS_D, Wasserstein1
+  ) %>%
+  gt(groupname_col = "Metric") %>%
+  tab_header(
+    title = md("**Table 1. Pairwise seasonal contrasts in null expectations of functional diversity**"),
+    subtitle = md(paste0(
+      "Mean differences: mean(Season2) − mean(Season1); bootstrap CI/p (B = ", B_boot, "); ",
+      "multiplicity correction across 18 tests: ", toupper(p_adjust), "."
+    ))
+  ) %>%
+  fmt_number(columns = c(`p (bootstrap)`, `p (adjusted)`), decimals = 4) %>%
+  fmt_number(columns = c(d_pooled, Overlap, KS_D, Wasserstein1), decimals = 3) %>%
+  data_color(
+    columns = Overlap,
+    colors = scales::col_numeric(
+      palette = c("#D73027", "#FDAE61", "#FFFFBF", "#ABD9E9", "#4575B4"),
+      domain = c(0, 1)
+    )
+  ) %>%
+  tab_footnote(
+    footnote = md("Overlap ranges from 0 (no overlap) to 1 (identical distributions)."),
+    locations = cells_column_labels(columns = "Overlap")
+  ) %>%
+  tab_footnote(
+    footnote = md("Supported = p(adjusted) < 0.05 across all 18 comparisons."),
+    locations = cells_column_labels(columns = "Supported")
+  ) %>%
+  tab_options(table.font.size = "small")
+table1_gt
+
+gtsave(table1_gt, file.path(tab_dir, "Table1_pairwise_seasonal_contrasts.png"))
+gtsave(table1_gt, file.path(tab_dir, "Table1_pairwise_seasonal_contrasts.docx"))
+gtsave(table1_gt, file.path(tab_dir, "Table1_pairwise_seasonal_contrasts.html"))
+
+# Save Table 1 as Excel (.xlsx)
+# (install once if needed) install.packages("writexl")
+library(writexl)
+
+table1_xls <- table1 %>%
+  dplyr::mutate(
+    Metric = factor(Metric, levels = c("FRic","FEve","FDiv"), ordered = TRUE)
+  ) %>%
+  dplyr::arrange(Metric, Comparison) %>%
+  dplyr::transmute(
+    Metric, Comparison,
+    Mean_Diff = Mean_Diff,
+    CI_Lower = CI_Lower,
+    CI_Upper = CI_Upper,
+    CI_95 = CI_95,
+    p_boot = p_boot,
+    p_adj = p_adj,
+    Supported = Supported_primary,
+    Direction,
+    d_pooled, d_class,
+    Overlap, Overlap_Level,
+    KS_D, Wasserstein1
+  )
+
+write_xlsx(
+  x = list(Table1 = table1_xls),
+  path = file.path(tab_dir, "Table1_pairwise_seasonal_contrasts.xlsx")
+)
+
+
+
+# -----------------------------------------------------------------------------
+# FIGURE (A–C): Δ draws + IQR(Δ) + CI(mean diff) + star(adjusted) + d label
+# -----------------------------------------------------------------------------
+# Plot order (top to bottom)
+plot_levels <- c("Winter vs Spring","Autumn vs Spring","Autumn vs Winter",
+                 "Summer vs Spring","Summer vs Winter","Summer vs Autumn")
+
+create_panel <- function(df, metric, table1_metric, n_delta = 8000, eps = 1e-12) {
+  
+  # Build Δ draws per comparison (independent draws, correct for this null generator)
+  delta_long <- purrr::map_dfr(plot_levels, function(comp) {
+    
+    # parse comp "A vs B" = Season1 vs Season2
+    s1 <- str_split(comp, " vs ", simplify = TRUE)[1]
+    s2 <- str_split(comp, " vs ", simplify = TRUE)[2]
+    
+    del <- draw_delta(df, metric, s1, s2, n = n_delta)
+    
+    tibble(
+      Metric = metric,
+      Comparison = comp,
+      Difference = del
+    )
+  }) %>%
+    dplyr::mutate(
+      Comparison = factor(Comparison, levels = plot_levels)
+    )
+  
+  # IQR of Δ draws (descriptive)
+  iqr_df <- delta_long %>%
+    dplyr::group_by(Comparison) %>%
+    dplyr::summarise(
+      q25 = quantile(Difference, 0.25, na.rm = TRUE),
+      q75 = quantile(Difference, 0.75, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Join with Table 1 quantities for this metric
+  ann <- table1_metric %>%
+    dplyr::select(Comparison, Mean_Diff, CI_Lower, CI_Upper, p_adj, Supported_primary, d_pooled) %>%
+    dplyr::mutate(
+      Comparison = factor(Comparison, levels = plot_levels),
+      sig = ifelse(Supported_primary == "Yes", "*", ""),
+      d_lab = sprintf("d=%.2f", d_pooled)
+    ) %>%
+    dplyr::left_join(iqr_df, by = "Comparison", relationship = "one-to-one")
+  
+  # axis padding for labels
+  x_min <- min(c(delta_long$Difference, ann$CI_Lower, ann$q25), na.rm = TRUE)
+  x_max <- max(c(delta_long$Difference, ann$CI_Upper, ann$q75), na.rm = TRUE)
+  x_rng <- x_max - x_min
+  
+  ann <- ann %>%
+    dplyr::mutate(
+      star_x = CI_Upper + 0.02 * x_rng,
+      d_x    = CI_Upper + 0.09 * x_rng
+    )
+  
+  ggplot(delta_long, aes(x = Difference, y = Comparison)) +
+    
+    ggdist::stat_halfeye(
+      aes(fill = after_stat(ifelse(x < 0, "Negative", "Positive"))),
+      .width = NULL, point_interval = NULL, slab_alpha = 0.90) +
+    
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.75) +
+    
+    # dot: Table 1 mean difference
+    ggplot2::geom_point(
+      data = ann,
+      ggplot2::aes(x = Mean_Diff, y = Comparison),
+      size = 1.8, color = "black",alpha = 0.9) +
+    
+    # thick: Q25–Q75 of Δ distribution (descriptive)
+    ggplot2::geom_segment(
+      data = ann,
+      ggplot2::aes(x = q25, xend = q75, y = Comparison, yend = Comparison),
+      linewidth = 1.4, color = "black",alpha = 0.5) +
+    
+    # thin: Table 1 CI for mean difference (primary)
+    ggplot2::geom_segment(
+      data = ann,
+      ggplot2::aes(x = CI_Lower, xend = CI_Upper, y = Comparison, yend = Comparison),
+      linewidth = 1.4, color = "green",alpha = 0.8) +
+    
+    # star: place slightly to the right of CI_Upper (only when supported)
+    ggplot2::geom_text(
+      data = ann %>% dplyr::filter(sig == "*"),
+      ggplot2::aes(x = star_x, y = Comparison),
+      label = "*", color = "black", size = 6) +
+    
+    # d label: further right so it doesn’t sit on the interval
+    ggplot2::geom_text(
+      data = ann,
+      ggplot2::aes(x = d_x, y = Comparison, label = d_lab),
+      hjust = 0, size = 3.5, color = "black") +
+    
+    scale_fill_manual(values = c("Negative" = "#E69F00", "Positive" = "#0072B2")) +
+    scale_y_discrete(labels = y_labs) +
+    FD_theme2() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 13, face = "bold"),
+      axis.title.y = element_blank(),
+      axis.text = element_text(colour = "black", size = 12)) +
+    labs(
+      title = metric,
+      x = "Difference Δ (Season2 − Season1)") +
+    coord_cartesian(xlim = c(x_min - 0.05*x_rng, x_max + 0.20*x_rng), clip = "off")
+}
+
+pA <- create_panel(null_data, "FRic", table1 %>% dplyr::filter(Metric == "FRic"), n_delta = n_delta, eps = eps)
+pB <- create_panel(null_data, "FEve", table1 %>% dplyr::filter(Metric == "FEve"), n_delta = n_delta, eps = eps)
+pC <- create_panel(null_data, "FDiv", table1 %>% dplyr::filter(Metric == "FDiv"), n_delta = n_delta, eps = eps)
+
+final_plot <- (pA / pB / pC) +
+  plot_annotation(
+    tag_levels = "A",
+    title = "Pairwise seasonal differences in null expectations",
+    subtitle = paste0(
+      "Half-eye density = Δ from independent null draws; dot = mean(Δ) = mean(Season2) − mean(Season1); ",
+      "thick segment = IQR(Δ); thin segment = 95% CI for mean(Δ) (bootstrap). ",
+      "* indicates multiplicity-adjusted support (", toupper(p_adjust), ", α=0.05). Labels show d_pooled."
+    )
+  ) &
+  theme(plot.margin = margin(6, 26, 6, 6))
+
+final_plot
+
+# -----------------------------------------------------------------------------
+# SAVE FIGURE (PNG + TIFF + PDF)
+# -----------------------------------------------------------------------------
+ggsave(file.path(fig_dir, "Fig_pairwise_halfeye_Table1_independent.png"),
+       final_plot, width = 8, height = 13, dpi = 600)
+
+ggsave(file.path(fig_dir, "Fig_pairwise_halfeye_Table1_independent.tiff"),
+       final_plot, width = 8, height = 13, dpi = 600, compression = "lzw")
+
+# PDF (try cairo; fallback to default pdf)
+pdf_out <- file.path(fig_dir, "Fig_pairwise_halfeye_Table1_independent.pdf")
+ok_cairo <- FALSE
+try({
+  ggsave(pdf_out, final_plot, width = 8, height = 13, device = cairo_pdf)
+  ok_cairo <- TRUE
+}, silent = TRUE)
+
+if(!ok_cairo) {
+  ggsave(pdf_out, final_plot, width = 8, height = 13, device = "pdf")
+}
+
+# -----------------------------------------------------------------------------
+# VERIFICATION SUMMARY (prints)
+# -----------------------------------------------------------------------------
+verify <- table1 %>%
+  dplyr::mutate(
+    Supported_ci_calc = (CI_Lower > 0 + eps) | (CI_Upper < 0 - eps),
+    Supported_adj_calc = (p_adj < alpha),
+    ok_primary = (Supported_primary == ifelse(Supported_adj_calc, "Yes", "No"))
+  ) %>%
+  dplyr::select(Metric, Comparison, Mean_Diff, CI_Lower, CI_Upper, p_boot, p_adj,
+                Supported_ci_calc, Supported_adj_calc, Supported_primary, ok_primary)
+
+print(verify)
+
+# =============================================================================
+# END

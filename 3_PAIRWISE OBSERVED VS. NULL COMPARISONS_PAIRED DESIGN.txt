@@ -1,0 +1,661 @@
+############################################################
+## PAIRWISE OBSERVED VS. NULL COMPARISONS: PAIRED DESIGN
+## Author: Eudriano Costa
+## Date: 2025
+## PURPOSE:
+## This script performs pairwise comparisons between observed seasonal
+## differences and null expectations using a PAIRED design.
+##
+## KEY DISTINCTION FROM PREVIOUS SCRIPT:
+## - This analysis assumes paired structure by Simulation ID
+## - Δ_null differences are computed WITHIN each simulation
+## - Appropriate when null seasons were generated with shared simulation structure
+##
+## STATISTICAL APPROACH:
+## 1. Compute observed difference: Δ_obs = Season2 - Season1
+## 2. Compute null distribution: Δ_null from paired simulation differences
+## 3. Test: H₀: Δ_obs is not different from null expectation
+## 4. Compute exact permutation p-value
+## 5. Apply multiplicity correction (Holm method)
+##
+## OUTPUT:
+## - Comprehensive table of paired comparisons
+## - Ready for integration with visualization and reporting
+############################################################
+
+# ============================================================================
+# SECTION 1: INITIALIZATION AND DATA PREPARATION
+# ============================================================================
+
+# Load required libraries with explicit version notes
+library(dplyr)    # Data manipulation (≥ 1.1.0)
+library(tidyr)    # Data reshaping (≥ 1.3.0)
+library(purrr)    # Functional programming (≥ 1.0.0)
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║     PAIRED PAIRWISE SEASONAL COMPARISON ANALYSIS               ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+# ============================================================================
+# SECTION 2: DEFINE CORE PARAMETERS
+# ============================================================================
+
+## FUNCTIONAL DIVERSITY METRICS TO ANALYZE -----------------------------------
+metrics <- c("FRic", "FEve", "FDiv")
+cat("✓ Functional diversity metrics to analyze:\n")
+cat("  1. FRic: Functional Richness\n")
+cat("  2. FEve: Functional Evenness\n")
+cat("  3. FDiv: Functional Divergence\n\n")
+
+## SEASONAL ORDERING ---------------------------------------------------------
+season_order <- c("Summer", "Autumn", "Winter", "Spring")
+cat("✓ Seasonal sequence (chronological):\n")
+cat("  ", paste(season_order, collapse = " → "), "\n\n")
+
+# ============================================================================
+# SECTION 3: DATA VALIDATION AND PREPARATION
+# ============================================================================
+
+cat("VALIDATING INPUT DATA...\n")
+
+## CHECK REQUIRED DATA OBJECTS -----------------------------------------------
+stopifnot("obs_df not found" = exists("obs_df"))
+stopifnot("null_data not found" = exists("null_data"))
+
+## VALIDATE OBSERVED DATA STRUCTURE ------------------------------------------
+required_obs_cols <- c("Season", "FRic_obs", "FEve_obs", "FDiv_obs")
+missing_obs <- setdiff(required_obs_cols, names(obs_df))
+if (length(missing_obs) > 0) {
+  stop("Missing columns in obs_df: ", paste(missing_obs, collapse = ", "))
+}
+
+## VALIDATE NULL DATA STRUCTURE ----------------------------------------------
+required_null_cols <- c("Season", "Simulation", metrics)
+missing_null <- setdiff(required_null_cols, names(null_data))
+if (length(missing_null) > 0) {
+  stop("Missing columns in null_data: ", paste(missing_null, collapse = ", "))
+}
+
+cat("✓ Input data validation passed\n")
+cat("  - obs_df dimensions:", paste(dim(obs_df), collapse = " × "), "\n")
+cat("  - null_data dimensions:", paste(dim(null_data), collapse = " × "), "\n")
+cat("  - Unique seasons in null_data:", 
+    paste(unique(null_data$Season), collapse = ", "), "\n\n")
+
+# ============================================================================
+# SECTION 4: HELPER FUNCTIONS
+# ============================================================================
+
+#' Generate standardized comparison name
+#' 
+#' @description
+#' Creates a consistent naming format for pairwise comparisons.
+#' 
+#' @param a First season name
+#' @param b Second season name
+#' @return Character string "SeasonA vs SeasonB"
+#' 
+#' @note
+#' Using consistent naming conventions is critical for merging results
+#' from different analyses and for clear reporting.
+
+pair_key <- function(a, b) {
+  paste(a, "vs", b)
+}
+
+#' Generate all unique pairwise comparisons
+#' 
+#' @description
+#' Creates list of all unique unordered pairs of seasons.
+#' 
+#' @param seasons Vector of season names
+#' @return List of character vectors, each containing two seasons
+#' 
+#' @details
+#' Uses combn() to generate combinations. For n seasons,
+#' number of pairs = n × (n-1) / 2 = 4 × 3 / 2 = 6
+
+pairs <- combn(season_order, 2, simplify = FALSE)
+
+cat("✓ Pairwise comparisons defined:\n")
+for (i in seq_along(pairs)) {
+  cat(sprintf("  %2d. %s\n", i, pair_key(pairs[[i]][1], pairs[[i]][2])))
+}
+cat("  Total comparisons per metric:", length(pairs), "\n\n")
+
+# ============================================================================
+# SECTION 5: TRANSFORM OBSERVED DATA TO LONG FORMAT
+# ============================================================================
+
+cat("TRANSFORMING OBSERVED DATA TO LONG FORMAT...\n")
+
+#' Transform observed data from wide to long format
+#' 
+#' @description
+#' Converts observed FD metrics from wide format (separate columns)
+#' to long format suitable for systematic pairwise comparisons.
+#' 
+#' @details
+#' Input structure (obs_df):
+#'   Season | FRic_obs | FEve_obs | FDiv_obs
+#'   
+#' Output structure:
+#'   Season | Metric | Obs
+#'   
+#' This format facilitates easy extraction of observed values
+#' for any season-metric combination.
+
+obs_long <- obs_df %>%
+  dplyr::select(Season, FRic_obs, FEve_obs, FDiv_obs) %>%
+  tidyr::pivot_longer(
+    cols = ends_with("_obs"),          # Select all observation columns
+    names_to = "Metric",               # Create Metric column
+    values_to = "Obs"                  # Create Obs column
+  ) %>%
+  dplyr::mutate(
+    Metric = sub("_obs", "", Metric)   # Remove "_obs" suffix
+  ) %>%
+  dplyr::arrange(Season, Metric)       # Sort for consistency
+
+cat("✓ Observed data transformed:\n")
+cat("  - Rows in obs_long:", nrow(obs_long), "\n")
+cat("  - Unique seasons:", n_distinct(obs_long$Season), "\n")
+cat("  - Metrics:", paste(unique(obs_long$Metric), collapse = ", "), "\n\n")
+
+# ============================================================================
+# SECTION 6: MAIN ANALYSIS - PAIRED COMPARISONS
+# ============================================================================
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║          COMPUTING PAIRED PAIRWISE COMPARISONS                  ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+#' Perform pairwise comparison analysis for all metrics and season pairs
+#' 
+#' @description
+#' For each metric and season pair:
+#' 1. Compute observed difference (Δ_obs = Season2 - Season1)
+#' 2. Extract PAIRED null differences (aligned by Simulation ID)
+#' 3. Compute permutation-based p-value
+#' 4. Calculate descriptive statistics of null distribution
+#' 
+#' @note
+#' CRITICAL: This analysis uses PAIRED design, where Δ_null differences
+#' are computed WITHIN each simulation. This is appropriate when null
+#' seasons share the same simulation structure (e.g., same random seeds).
+
+pairwise_obs_vs_null <- purrr::map_dfr(metrics, function(m) {
+  
+  cat(sprintf("Processing %s...\n", m))
+  
+  purrr::map_dfr(pairs, function(p) {
+    s1 <- p[1]  # Reference season (subtracted from)
+    s2 <- p[2]  # Comparison season
+    
+    # ------------------------------------------------------------
+    # STEP A: COMPUTE OBSERVED DIFFERENCE
+    # ------------------------------------------------------------
+    # Δ_obs = Observed(Season2) - Observed(Season1)
+    obs_s2 <- obs_long %>% 
+      dplyr::filter(Season == s2, Metric == m) %>% 
+      dplyr::pull(Obs)
+    
+    obs_s1 <- obs_long %>% 
+      dplyr::filter(Season == s1, Metric == m) %>% 
+      dplyr::pull(Obs)
+    
+    # Safety check for missing observations
+    if (length(obs_s2) == 0 || length(obs_s1) == 0) {
+      warning(sprintf("Missing observations for %s: %s vs %s", m, s1, s2))
+      d_obs <- NA_real_
+    } else {
+      d_obs <- obs_s2 - obs_s1
+    }
+    
+    # ------------------------------------------------------------
+    # STEP B: EXTRACT PAIRED NULL DIFFERENCES
+    # ------------------------------------------------------------
+    # CRITICAL: This is a PAIRED design
+    # Differences are computed WITHIN each simulation (by Simulation ID)
+    # This maintains the correlation structure in the null model
+    
+    d_null <- null_data %>%
+      dplyr::filter(Season %in% c(s1, s2)) %>%
+      dplyr::select(Season, Simulation, all_of(m)) %>%
+      # Pivot to wide format: one row per simulation
+      tidyr::pivot_wider(
+        names_from = Season, 
+        values_from = all_of(m)
+      ) %>%
+      # Compute paired difference: Season2 - Season1
+      # .data[[variable]] ensures proper evaluation
+      dplyr::transmute(
+        d = .data[[s2]] - .data[[s1]]
+      ) %>%
+      dplyr::pull(d)  # Extract as vector
+    
+    # ------------------------------------------------------------
+    # STEP C: QUALITY CONTROL FOR NULL DIFFERENCES
+    # ------------------------------------------------------------
+    # Remove NA and infinite values
+    d_null_clean <- d_null[is.finite(d_null)]
+    n_valid <- length(d_null_clean)
+    
+    if (n_valid < 10) {
+      warning(sprintf("Insufficient valid null differences for %s: %s vs %s (n=%d)", 
+                     m, s1, s2, n_valid))
+    }
+    
+    # ------------------------------------------------------------
+    # STEP D: COMPUTE NULL DISTRIBUTION STATISTICS
+    # ------------------------------------------------------------
+    mu_null <- mean(d_null_clean, na.rm = TRUE)
+    sd_null <- sd(d_null_clean, na.rm = TRUE)
+    med_null <- median(d_null_clean, na.rm = TRUE)
+    
+    # ------------------------------------------------------------
+    # STEP E: COMPUTE PERMUTATION P-VALUE (TWO-TAILED)
+    # ------------------------------------------------------------
+    # Permutation test rationale:
+    # Under H₀, observed difference is exchangeable with null differences
+    # p-value = proportion of null differences as extreme as observed
+    
+    if (n_valid > 0 && !is.na(d_obs)) {
+      p_two <- (sum(abs(d_null_clean - mu_null) >= abs(d_obs - mu_null), 
+                    na.rm = TRUE) + 1) / (n_valid + 1)
+    } else {
+      p_two <- NA_real_
+    }
+    
+    # ------------------------------------------------------------
+    # STEP F: COMPUTE EFFECT SIZE (STANDARDIZED)
+    # ------------------------------------------------------------
+    # Standardized effect: (Δ_obs - μ_null) / σ_null
+    if (sd_null > 0 && !is.na(d_obs)) {
+      effect_size <- (d_obs - mu_null) / sd_null
+    } else {
+      effect_size <- NA_real_
+    }
+    
+    # ------------------------------------------------------------
+    # STEP G: COMPUTE CONFIDENCE INTERVALS (PERCENTILE)
+    # ------------------------------------------------------------
+    if (n_valid >= 20) {
+      ci_lower <- quantile(d_null_clean, 0.025, na.rm = TRUE)
+      ci_upper <- quantile(d_null_clean, 0.975, na.rm = TRUE)
+    } else {
+      ci_lower <- NA_real_
+      ci_upper <- NA_real_
+    }
+    
+    # ------------------------------------------------------------
+    # STEP H: RETURN COMPREHENSIVE RESULTS
+    # ------------------------------------------------------------
+    tibble::tibble(
+      # Identification
+      Metric = m,
+      Comparison = pair_key(s1, s2),
+      Season1 = s1,
+      Season2 = s2,
+      
+      # Observed values
+      Obs1 = obs_s1,
+      Obs2 = obs_s2,
+      Obs_Diff = d_obs,
+      
+      # Null distribution parameters
+      NullDiff_n = n_valid,
+      NullDiff_mean = mu_null,
+      NullDiff_sd = sd_null,
+      NullDiff_median = med_null,
+      NullDiff_q025 = ci_lower,
+      NullDiff_q975 = ci_upper,
+      NullDiff_iqr = IQR(d_null_clean, na.rm = TRUE),
+      
+      # Effect size
+      Effect_Size = effect_size,
+      Effect_Magnitude = dplyr::case_when(
+        is.na(effect_size) ~ NA_character_,
+        abs(effect_size) < 0.2 ~ "Negligible",
+        abs(effect_size) < 0.5 ~ "Small",
+        abs(effect_size) < 0.8 ~ "Medium",
+        abs(effect_size) < 1.3 ~ "Large",
+        TRUE ~ "Very Large"
+      ),
+      
+      # Statistical testing
+      p_raw = p_two,
+      
+      # Descriptive flags
+      Direction = dplyr::case_when(
+        is.na(d_obs) ~ NA_character_,
+        d_obs > 0 ~ paste(s2, ">", s1),
+        d_obs < 0 ~ paste(s1, ">", s2),
+        TRUE ~ "Equal"
+      ),
+      
+      # Data quality flags
+      Obs_Status = ifelse(is.na(d_obs), "Missing", "Present"),
+      Null_Status = ifelse(n_valid >= 10, "Sufficient", "Insufficient")
+    )
+  })
+})
+
+cat("✓ Paired pairwise analysis completed\n")
+cat("  Total comparisons computed:", nrow(pairwise_obs_vs_null), "\n\n")
+
+# ============================================================================
+# SECTION 7: MULTIPLICITY CORRECTION AND SIGNIFICANCE ASSESSMENT
+# ============================================================================
+
+cat("APPLYING MULTIPLICITY CORRECTION...\n")
+
+#' Apply Holm-Bonferroni correction for multiple testing
+#' 
+#' @description
+#' Controls family-wise error rate (FWER) across all comparisons.
+#' Applied separately within each metric to account for correlation structure.
+#' 
+#' @details
+#' The Holm procedure:
+#' 1. Sort p-values from smallest to largest: p(1) ≤ p(2) ≤ ... ≤ p(m)
+#' 2. Compare each p(i) to α/(m - i + 1)
+#' 3. More powerful than Bonferroni while maintaining strong control
+
+pairwise_obs_vs_null <- pairwise_obs_vs_null %>%
+  # Group by metric for separate correction
+  dplyr::group_by(Metric) %>%
+  dplyr::mutate(
+    # Apply Holm correction
+    p_adj = stats::p.adjust(p_raw, method = "holm"),
+    
+    # Significance flags
+    Supported_raw = ifelse(p_raw < 0.05, "Yes", "No"),
+    Supported_adj = ifelse(p_adj < 0.05, "Yes", "No"),
+    
+    # Confidence level categorization
+    Confidence = dplyr::case_when(
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01  ~ "**",
+      p_adj < 0.05  ~ "*",
+      p_raw < 0.05 ~ "†",  # Raw significant but not after correction
+      TRUE ~ "ns"
+    ),
+    
+    # Interpretation helper
+    Interpretation = dplyr::case_when(
+      Supported_adj == "Yes" & Obs_Diff > 0 ~ 
+        paste(Season2, "significantly higher than", Season1),
+      Supported_adj == "Yes" & Obs_Diff < 0 ~ 
+        paste(Season2, "significantly lower than", Season1),
+      Supported_raw == "Yes" & Obs_Diff > 0 ~ 
+        paste(Season2, "nominally higher than", Season1),
+      Supported_raw == "Yes" & Obs_Diff < 0 ~ 
+        paste(Season2, "nominally lower than", Season1),
+      TRUE ~ "No significant difference"
+    ),
+    
+    # Practical significance indicator
+    Practical_Significance = dplyr::case_when(
+      Supported_adj == "Yes" & Effect_Magnitude %in% c("Large", "Very Large") ~
+        "Statistically & practically significant",
+      Supported_adj == "Yes" & Effect_Magnitude %in% c("Medium") ~
+        "Statistically significant, moderate effect",
+      Supported_adj == "Yes" & Effect_Magnitude %in% c("Small", "Negligible") ~
+        "Statistically significant, small effect",
+      Supported_raw == "Yes" ~ "Nominally significant",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  # Reorder columns for readability
+  dplyr::select(
+    # Identification
+    Metric, Comparison, Season1, Season2,
+    
+    # Observed values
+    Obs_Diff, Direction, Obs1, Obs2,
+    
+    # Null distribution
+    NullDiff_n, NullDiff_mean, NullDiff_sd, NullDiff_median,
+    NullDiff_iqr, NullDiff_q025, NullDiff_q975,
+    
+    # Effect size
+    Effect_Size, Effect_Magnitude,
+    
+    # Statistical testing
+    p_raw, p_adj, Supported_raw, Supported_adj, Confidence,
+    
+    # Interpretation
+    Interpretation, Practical_Significance,
+    
+    # Data quality
+    Obs_Status, Null_Status
+  )
+
+cat("✓ Multiplicity correction applied (Holm method)\n\n")
+
+# ============================================================================
+# SECTION 8: SUMMARY STATISTICS AND REPORTING
+# ============================================================================
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║                  ANALYSIS SUMMARY                               ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+## OVERALL SIGNIFICANCE SUMMARY ---------------------------------------------
+summary_stats <- pairwise_obs_vs_null %>%
+  dplyr::group_by(Metric) %>%
+  dplyr::summarise(
+    n_comparisons = dplyr::n(),
+    n_valid_obs = sum(Obs_Status == "Present"),
+    n_valid_null = sum(Null_Status == "Sufficient"),
+    n_raw_sig = sum(Supported_raw == "Yes", na.rm = TRUE),
+    n_adj_sig = sum(Supported_adj == "Yes", na.rm = TRUE),
+    perc_raw_sig = round(n_raw_sig / n_comparisons * 100, 1),
+    perc_adj_sig = round(n_adj_sig / n_comparisons * 100, 1),
+    mean_abs_effect = round(mean(abs(Effect_Size), na.rm = TRUE), 3),
+    sd_abs_effect = round(sd(abs(Effect_Size), na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+cat("SIGNIFICANCE BY METRIC (α = 0.05):\n")
+cat("────────────────────────────────────────────────────\n")
+for (i in 1:nrow(summary_stats)) {
+  row <- summary_stats[i, ]
+  cat(sprintf("%-5s: %d/%d raw significant (%d%%), %d/%d after correction (%d%%)\n",
+              row$Metric,
+              row$n_raw_sig, row$n_comparisons, row$perc_raw_sig,
+              row$n_adj_sig, row$n_comparisons, row$perc_adj_sig))
+}
+cat("\n")
+
+## EFFECT SIZE DISTRIBUTION -------------------------------------------------
+effect_summary <- pairwise_obs_vs_null %>%
+  dplyr::group_by(Metric, Effect_Magnitude) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_effect = round(mean(Effect_Size, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Effect_Magnitude,
+    values_from = c(n, mean_effect),
+    names_sep = "_"
+  )
+
+cat("EFFECT SIZE DISTRIBUTION (Cohen's d equivalents):\n")
+cat("────────────────────────────────────────────────────\n")
+print(effect_summary)
+cat("\n")
+
+## MOST STRIKING COMPARISONS ------------------------------------------------
+cat("TOP 3 LARGEST EFFECTS PER METRIC:\n")
+cat("────────────────────────────────────────────────────\n")
+
+top_effects <- pairwise_obs_vs_null %>%
+  dplyr::group_by(Metric) %>%
+  dplyr::arrange(dplyr::desc(abs(Effect_Size))) %>%
+  dplyr::slice_head(n = 3) %>%
+  dplyr::select(Metric, Comparison, Obs_Diff, Effect_Size, 
+                Effect_Magnitude, Confidence, Interpretation)
+
+print(top_effects, n = Inf)
+cat("\n")
+
+## PRACTICAL SIGNIFICANCE SUMMARY -------------------------------------------
+practical_summary <- pairwise_obs_vs_null %>%
+  dplyr::group_by(Metric, Practical_Significance) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+
+cat("PRACTICAL SIGNIFICANCE CATEGORIES:\n")
+cat("────────────────────────────────────────────────────\n")
+print(practical_summary, n = Inf)
+cat("\n")
+
+# ============================================================================
+# SECTION 9: CREATE PUBLICATION-READY OUTPUT
+# ============================================================================
+
+## FORMAT FOR PUBLICATION ----------------------------------------------------
+pairwise_publication <- pairwise_obs_vs_null %>%
+  dplyr::mutate(
+    # Format numeric columns
+    Obs_Diff = round(Obs_Diff, 5),
+    Effect_Size = round(Effect_Size, 3),
+    NullDiff_mean = round(NullDiff_mean, 5),
+    NullDiff_sd = round(NullDiff_sd, 5),
+    p_raw = round(p_raw, 5),
+    p_adj = round(p_adj, 5),
+    
+    # Create formatted strings
+    Obs_Range = sprintf("%.3f–%.3f", Obs1, Obs2),
+    Null_CI_95 = sprintf("[%.5f, %.5f]", NullDiff_q025, NullDiff_q975),
+    Null_Summary = sprintf("μ=%.5f ± %.5f", NullDiff_mean, NullDiff_sd),
+    
+    # Format p-values
+    p_raw_formatted = dplyr::case_when(
+      p_raw < 0.0001 ~ "<0.0001",
+      p_raw < 0.001  ~ sprintf("%.4f", p_raw),
+      p_raw < 0.01   ~ sprintf("%.3f", p_raw),
+      TRUE ~ sprintf("%.2f", p_raw)
+    ),
+    
+    p_adj_formatted = dplyr::case_when(
+      p_adj < 0.0001 ~ "<0.0001",
+      p_adj < 0.001  ~ sprintf("%.4f", p_adj),
+      p_adj < 0.01   ~ sprintf("%.3f", p_adj),
+      TRUE ~ sprintf("%.2f", p_adj)
+    )
+  ) %>%
+  dplyr::select(
+    Metric, Comparison, Season1, Season2,
+    Obs_Diff, Direction,
+    Effect_Size, Effect_Magnitude,
+    Null_CI_95, Null_Summary,
+    p_raw = p_raw_formatted,
+    p_adj = p_adj_formatted,
+    Confidence, Interpretation,
+    Practical_Significance
+  )
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║              FINAL RESULTS TABLE READY                          ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("Sample of formatted results:\n")
+cat("────────────────────────────────────────────────────\n")
+print(head(pairwise_publication, 3))
+cat("\n")
+
+cat("DIMENSIONS OF FINAL DATASET:\n")
+cat("────────────────────────────────────────────────────\n")
+cat("Rows:", nrow(pairwise_obs_vs_null), "\n")
+cat("Columns:", ncol(pairwise_obs_vs_null), "\n")
+cat("Unique metrics:", n_distinct(pairwise_obs_vs_null$Metric), "\n")
+cat("Unique comparisons:", n_distinct(pairwise_obs_vs_null$Comparison), "\n\n")
+
+# ============================================================================
+# SECTION 10: SAVE RESULTS
+# ============================================================================
+
+## Save detailed results -----------------------------------------------------
+saveRDS(pairwise_obs_vs_null, "pairwise_paired_comparison_detailed_results.rds")
+saveRDS(pairwise_publication, "pairwise_paired_comparison_publication_ready.rds")
+
+## Export as CSV for external use --------------------------------------------
+write.csv(pairwise_obs_vs_null, 
+          "pairwise_paired_comparison_detailed_results.csv", 
+          row.names = FALSE)
+
+write.csv(pairwise_publication, 
+          "pairwise_paired_comparison_publication_ready.csv", 
+          row.names = FALSE)
+
+cat("RESULTS SAVED TO:\n")
+cat("────────────────────────────────────────────────────\n")
+cat("1. pairwise_paired_comparison_detailed_results.rds\n")
+cat("2. pairwise_paired_comparison_detailed_results.csv\n")
+cat("3. pairwise_paired_comparison_publication_ready.rds\n")
+cat("4. pairwise_paired_comparison_publication_ready.csv\n\n")
+
+# ============================================================================
+# SECTION 11: ASSIGN TO GLOBAL ENVIRONMENT FOR IMMEDIATE USE
+# ============================================================================
+
+## Assign to global environment for immediate use ---------------------------
+assign("pairwise_paired_results", pairwise_obs_vs_null, envir = .GlobalEnv)
+assign("pairwise_paired_table", pairwise_publication, envir = .GlobalEnv)
+
+cat("KEY OBJECTS AVAILABLE IN WORKSPACE:\n")
+cat("────────────────────────────────────────────────────\n")
+cat("1. pairwise_paired_results: Detailed analysis results\n")
+cat("2. pairwise_paired_table: Publication-ready formatted table\n\n")
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           ANALYSIS COMPLETE - READY FOR USE                     ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n")
+
+## Return the main results ---------------------------------------------------
+pairwise_obs_vs_null
+
+# CRITICAL DISTINCTION FROM PREVIOUS ANALYSIS:
+# This script uses PAIRED design, where Δ_null differences are computed
+# WITHIN each simulation (aligned by Simulation ID).
+# 
+# This is appropriate when:
+# 1. Null seasons share the same simulation structure
+# 2. There is correlation between seasons in the null model
+# 3. You want to account for within-simulation variability
+# 
+# Contrast with independent design:
+# - Independent: Δ = random(Season2) - random(Season1)
+# - Paired: Δ = Season2[sim_i] - Season1[sim_i]
+# Effect size interpretation framework:
+# |d| < 0.2 : Negligible (likely not meaningful)
+# 0.2-0.5   : Small (may be ecologically relevant)
+# 0.5-0.8   : Medium (ecologically meaningful)
+# 0.8-1.3   : Large (strong ecological effect)
+# >1.3      : Very Large (very strong ecological effect)
+
+# NEW: Practical significance categories:
+# 1. "Statistically & practically significant" - Both p<0.05 and |d|>0.8
+# 2. "Statistically significant, moderate effect" - p<0.05, |d|=0.5-0.8
+# 3. "Statistically significant, small effect" - p<0.05, |d|<0.5
+# 4. "Nominally significant" - p_raw<0.05 but p_adj≥0.05
+# 5. "Not significant" - p_raw≥0.05
+
+# PAIRED vs INDEPENDENT DESIGN:
+# 
+# When to use PAIRED (this script):
+# - Null seasons generated with correlation structure
+# - Want to account for within-simulation variability
+# - Observed data are naturally paired (same sites, years)
+# 
+# When to use INDEPENDENT (previous script):
+# - Seasons simulated completely independently
+# - No correlation structure in null model
+# - Want most conservative test (independent draws)

@@ -1,0 +1,553 @@
+############################################################
+## NULL MODEL ANALYSIS FOR FUNCTIONAL DIVERSITY
+## Author: Eudriano Costa
+## Date: 2025
+## 
+## PURPOSE:
+## This script implements permutation-based null models to test whether
+## observed functional diversity metrics (FRic, FEve, FDiv) differ
+## significantly from random expectations given species richness and
+## abundance distributions across seasons.
+##
+## STATISTICAL FRAMEWORK:
+## - H₀: Observed FD = Expected FD from random assembly
+## - Test statistic: Standardized Effect Size (SES)
+## - Inference: Compare observed values to null distribution (n=999)
+##
+## KEY FEATURES:
+## 1. Maintains observed richness and abundance distribution
+## 2. Randomizes species identities and trait-abundance relationships
+## 3. Computes SES and exact p-values via permutation
+############################################################
+
+# ============================================================================
+# SECTION 1: INITIALIZATION AND DATA PREPARATION
+# ============================================================================
+
+## LOAD REQUIRED PACKAGES ----------------------------------------------------
+## Note: Package loading order matters for function masking
+library(dplyr)      # Data manipulation with %>% pipeline
+library(tidyr)      # Data reshaping (pivot_longer/wider)
+library(purrr)      # Functional programming for map/reduce
+library(ggplot2)    # Grammar of graphics for visualization
+library(gt)         # Create publication-quality tables
+library(gtsummary)  # Automated summary tables
+library(patchwork)  # Combine multiple ggplot2 plots
+library(ggdist)     # Visualize distributions and uncertainty
+library(scales)     # Format plot scales and labels
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           FUNCTIONAL DIVERSITY NULL MODEL ANALYSIS              ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+## DEFINE CORE DATA STRUCTURES ------------------------------------------------
+## Trait_space_mat: PCoA coordinates matrix (species × trait axes)
+## This represents species positions in multidimensional trait space
+## IMPORTANT: Rows = species, Columns = trait axes
+Trait_space_mat <- coord_use
+sp_pool <- rownames(Trait_space_mat)  # Regional species pool
+
+cat("✓ Trait space matrix loaded\n")
+cat("  - Species in pool:", nrow(Trait_space_mat), "\n")
+cat("  - Trait dimensions:", ncol(Trait_space_mat), "\n\n")
+
+## SET SEASONAL ORDERING ------------------------------------------------------
+## Ecological seasons in chronological order for proper temporal analysis
+season_order <- c("Summer", "Autumn", "Winter", "Spring")
+
+## Extract season labels from community matrix
+## IMPORTANT: Mat2_use should have seasons as rownames, species as colnames
+seasons <- rownames(Mat2_use) %>%
+  factor(levels = season_order) %>%   # Convert to factor with proper ordering
+  .[!is.na(.)]                        # Remove any NA values
+
+cat("✓ Seasons identified:", paste(seasons, collapse = ", "), "\n")
+cat("  - Chronological order preserved\n\n")
+
+## SET ANALYSIS PARAMETERS ----------------------------------------------------
+n_perm <- 999      # Number of permutations per season
+## NOTE: 999 permutations provides stable p-values down to ~0.001
+## Increasing to 9999 would provide p-values to ~0.0001 but increases runtime
+
+set.seed(123)      # CRITICAL: Ensures reproducibility
+## Seed value 123 is arbitrary but should be documented for reproducibility
+
+# ============================================================================
+# SECTION 2: CORE FUNCTION FOR FD METRIC CALCULATION
+# ============================================================================
+
+#' Compute Functional Diversity Metrics for a Single Community
+#' 
+#' @description
+#' Calculates three key functional diversity metrics using the dbFD function
+#' from the FD package with proper abundance weighting.
+#' 
+#' @param abund_vec_named Named numeric vector of species abundances
+#'        (names = species IDs, values = abundances)
+#' 
+#' @return A numeric vector with three elements: FRic, FEve, FDiv
+#'         Returns NA for all metrics if < 3 species present
+#' 
+#' @details
+#' This function implements the following computational steps:
+#' 1. Filters zero-abundance species
+#' 2. Matches species between community and trait space
+#' 3. Formats data for dbFD function
+#' 4. Computes metrics with abundance weighting (w.abun = TRUE)
+#' 
+#' @note
+#' The w.abun = TRUE parameter is CRITICAL for FEve and FDiv calculations.
+#' Without this, these metrics are calculated based on presence/absence only,
+#' which can lead to misleading results in abundance-weighted analyses.
+#' 
+#' FRic: Functional Richness - volume of trait space occupied
+#' FEve: Functional Evenness - regularity of abundance distribution in trait space
+#' FDiv: Functional Divergence - deviation of abundant species from trait space center
+
+compute_fd_one <- function(abund_vec_named) {
+  # Step 1: Remove species with zero abundance
+  abund_vec_named <- abund_vec_named[abund_vec_named > 0]
+  
+  # Step 2: Match species between community and trait space
+  sp_use <- intersect(names(abund_vec_named), rownames(Trait_space_mat))
+  
+  # Step 3: Check minimum species requirement
+  # dbFD requires ≥3 species to compute convex hull for FRic
+  if (length(sp_use) < 3) {
+    return(c(FRic = NA, FEve = NA, FDiv = NA))
+  }
+  
+  # Step 4: Subset to matching species
+  abund_use  <- abund_vec_named[sp_use]
+  traits_use <- Trait_space_mat[sp_use, , drop = FALSE]
+  
+  # Step 5: Format as community matrix (required by dbFD)
+  # Single row matrix: row = community, columns = species
+  comm <- matrix(
+    abund_use,
+    nrow = 1,
+    dimnames = list("sim", sp_use)
+  )
+  
+  # Step 6: Compute functional diversity metrics
+  # CRITICAL PARAMETERS EXPLAINED:
+  # w.abun = TRUE → FEve and FDiv weighted by species abundances
+  # stand.x = FALSE → Trait matrix already standardized
+  # stand.FRic = FALSE → FRic not standardized (use absolute values)
+  # m = "max" → Use all PCoA axes (preserve all trait information)
+  res <- FD::dbFD(
+    x = traits_use,    # Trait matrix (species × traits)
+    a = comm,          # Community matrix (communities × species)
+    w.abun = TRUE,     # ABUNDANCE WEIGHTING FOR FEve AND FDiv
+    calc.FRic = TRUE,  # Compute functional richness
+    calc.FDiv = TRUE,  # Compute functional divergence
+    calc.FGR = FALSE,  # Skip functional group richness
+    calc.CWM = FALSE,  # Skip community-weighted means
+    stand.x = FALSE,   # Don't standardize traits (assuming pre-standardized)
+    corr = "none",     # No correction for negative eigenvalues
+    m = "max",         # Use maximum number of PCoA axes
+    stand.FRic = FALSE,# Keep FRic as absolute volume (not standardized 0-1)
+    scale.RaoQ = FALSE,# Don't scale Rao's quadratic entropy
+    messages = FALSE   # Suppress progress messages
+  )
+  
+  # Step 7: Extract and return results
+  c(
+    FRic = ifelse(is.null(res$FRic), NA, res$FRic["sim"]),
+    FEve = ifelse(is.null(res$FEve), NA, res$FEve["sim"]),
+    FDiv = ifelse(is.null(res$FDiv), NA, res$FDiv["sim"])
+  )
+}
+
+cat("✓ FD calculation function defined\n")
+cat("  - Metrics: FRic, FEve, FDiv\n")
+cat("  - Minimum species: 3 (for convex hull calculation)\n")
+cat("  - Abundance weighting: ENABLED for FEve and FDiv\n\n")
+
+# ============================================================================
+# SECTION 3: NULL MODEL IMPLEMENTATION
+# ============================================================================
+
+## INITIALIZE STORAGE CONTAINERS ---------------------------------------------
+all_null_values <- list()      # Store ALL simulated values for each season
+null_results_list <- list()    # Store SUMMARY statistics for each season
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║               BEGINNING NULL MODEL PERMUTATIONS                 ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("PARAMETERS:\n")
+cat("  Permutations per season:", n_perm, "\n")
+cat("  Total seasons:", length(seasons), "\n")
+cat("  Total communities to simulate:", n_perm * length(seasons), "\n\n")
+
+## CREATE PROGRESS BAR -------------------------------------------------------
+## Visual feedback is essential for long-running permutations
+cat("Progress:\n")
+pb <- txtProgressBar(
+  min = 0, 
+  max = length(seasons), 
+  style = 3,          # Style 3 shows percentage and bar
+  width = 50,         # Width of progress bar
+  char = "█"         # Filled character
+)
+
+# ============================================================================
+# SECTION 4: MAIN LOOP - PROCESS EACH SEASON
+# ============================================================================
+
+for (idx in seq_along(seasons)) {
+  current_season <- as.character(seasons[idx])
+  setTxtProgressBar(pb, idx)  # Update progress bar
+  
+  cat(sprintf("\nProcessing %s (Season %d/%d)...\n", 
+              current_season, idx, length(seasons)))
+  
+  # -------------------------------------------------------------
+  # STEP A: EXTRACT OBSERVED COMMUNITY DATA
+  # -------------------------------------------------------------
+  ## Extract observed abundance vector for this season
+  abund_obs <- Mat2_use[current_season, ]
+  
+  ## Remove zero-abundance species
+  abund_obs <- abund_obs[abund_obs > 0]
+  
+  ## Calculate basic community properties
+  richness <- length(abund_obs)      # Number of species
+  total_abund <- sum(abund_obs)      # Total abundance
+  
+  ## Extract observed FD metrics from original analysis
+  obs_row <- FD_all %>% filter(Assemblage == current_season)
+  obs_FRic <- obs_row$FRic_abs
+  obs_FEve <- obs_row$FEve
+  obs_FDiv <- obs_row$FDiv
+  
+  # -------------------------------------------------------------
+  # STEP B: GENERATE NULL COMMUNITIES VIA PERMUTATION
+  # -------------------------------------------------------------
+  ## Initialize matrix to store simulation results
+  ## Rows = permutations, Columns = FD metrics
+  sim_vals <- matrix(
+    NA, 
+    nrow = n_perm, 
+    ncol = 3,
+    dimnames = list(NULL, c("FRic", "FEve", "FDiv"))
+  )
+  
+  ## NULL MODEL RATIONALE:
+  ## 1. Maintain observed species richness (ecological constraint)
+  ## 2. Maintain observed abundance distribution (sampling effort)
+  ## 3. Randomize species identities from regional pool (null hypothesis)
+  ## 4. Randomly assign abundances to species (break trait-abundance links)
+  
+  for (i in 1:n_perm) {
+    # Randomly sample species from regional pool (maintains richness)
+    sp_sim <- sample(sp_pool, size = richness, replace = FALSE)
+    
+    # Use observed abundance values (maintains abundance distribution)
+    abund_sim <- abund_obs
+    
+    # Randomly assign abundances to sampled species 
+    # This breaks any existing trait-abundance relationships
+    names(abund_sim) <- sample(sp_sim, length(abund_obs), replace = FALSE)
+    
+    # Compute FD metrics for this null community
+    sim_vals[i, ] <- compute_fd_one(abund_sim)
+  }
+  
+  # -------------------------------------------------------------
+  # STEP C: STORE RAW SIMULATION DATA
+  # -------------------------------------------------------------
+  ## Convert matrix to dataframe and add metadata
+  sim_vals_df <- as.data.frame(sim_vals) %>%
+    mutate(
+      Season = current_season,
+      Simulation = 1:n_perm,
+      .before = 1  # Add metadata columns first
+    )
+  
+  ## Store in list for later combination
+  all_null_values[[current_season]] <- sim_vals_df
+  
+  # -------------------------------------------------------------
+  # STEP D: COMPUTE NULL DISTRIBUTION STATISTICS
+  # -------------------------------------------------------------
+  ## Remove NA values (communities with < 3 species)
+  sim_vals_clean <- na.omit(sim_vals)
+  n_valid <- nrow(sim_vals_clean)  # Number of valid permutations
+  
+  ## Calculate descriptive statistics of null distribution
+  FRic_mean <- mean(sim_vals_clean[, "FRic"], na.rm = TRUE)
+  FRic_sd   <- sd(sim_vals_clean[, "FRic"], na.rm = TRUE)
+  
+  FEve_mean <- mean(sim_vals_clean[, "FEve"], na.rm = TRUE)
+  FEve_sd   <- sd(sim_vals_clean[, "FEve"], na.rm = TRUE)
+  
+  FDiv_mean <- mean(sim_vals_clean[, "FDiv"], na.rm = TRUE)
+  FDiv_sd   <- sd(sim_vals_clean[, "FDiv"], na.rm = TRUE)
+  
+  # -------------------------------------------------------------
+  # STEP E: CALCULATE STANDARDIZED EFFECT SIZES (SES)
+  # -------------------------------------------------------------
+  ## SES = (Observed - Null Mean) / Null SD
+  ## Interpretation: SES ~ z-score, SES > |1.96| ≈ p < 0.05
+  
+  FRic_SES <- ifelse(FRic_sd > 0, (obs_FRic - FRic_mean) / FRic_sd, NA)
+  FEve_SES <- ifelse(FEve_sd > 0, (obs_FEve - FEve_mean) / FEve_sd, NA)
+  FDiv_SES <- ifelse(FDiv_sd > 0, (obs_FDiv - FDiv_mean) / FDiv_sd, NA)
+  
+  # -------------------------------------------------------------
+  # STEP F: COMPUTE EXACT P-VALUES VIA PERMUTATION
+  # -------------------------------------------------------------
+  ## FRic: One-tailed tests (directional hypotheses)
+  ## Lower tail: Observed FRic ≤ Null FRic (community fills less space)
+  ## Upper tail: Observed FRic ≥ Null FRic (community fills more space)
+  FRic_p_lower <- (sum(sim_vals_clean[, "FRic"] <= obs_FRic, na.rm = TRUE) + 1) /
+    (n_valid + 1)
+  FRic_p_upper <- (sum(sim_vals_clean[, "FRic"] >= obs_FRic, na.rm = TRUE) + 1) /
+    (n_valid + 1)
+  
+  ## FEve and FDiv: Two-tailed tests (non-directional)
+  ## Tests whether observed value is unusually extreme in either direction
+  FEve_p_two <- (sum(abs(sim_vals_clean[, "FEve"] - FEve_mean) >=
+                       abs(obs_FEve - FEve_mean),
+                     na.rm = TRUE) + 1) / (n_valid + 1)
+  
+  FDiv_p_two <- (sum(abs(sim_vals_clean[, "FDiv"] - FDiv_mean) >=
+                       abs(obs_FDiv - FDiv_mean),
+                     na.rm = TRUE) + 1) / (n_valid + 1)
+  
+  # -------------------------------------------------------------
+  # STEP G: COMPILE SEASON SUMMARY
+  # -------------------------------------------------------------
+  null_results_list[[current_season]] <- data.frame(
+    # Basic community properties
+    Season       = current_season,
+    Richness     = richness,
+    TotalAbund   = total_abund,
+    N_valid_perm = n_valid,
+    
+    # Observed FD metrics
+    FRic_obs     = obs_FRic,
+    FEve_obs     = obs_FEve,
+    FDiv_obs     = obs_FDiv,
+    
+    # Null distribution parameters
+    FRic_null_mu = FRic_mean,
+    FRic_null_sd = FRic_sd,
+    FEve_null_mu = FEve_mean,
+    FEve_null_sd = FEve_sd,
+    FDiv_null_mu = FDiv_mean,
+    FDiv_null_sd = FDiv_sd,
+    
+    # Standardized effect sizes
+    FRic_SES     = FRic_SES,
+    FEve_SES     = FEve_SES,
+    FDiv_SES     = FDiv_SES,
+    
+    # P-values
+    FRic_p_lower = FRic_p_lower,
+    FRic_p_upper = FRic_p_upper,
+    FEve_p_two   = FEve_p_two,
+    FDiv_p_two   = FDiv_p_two,
+    
+    # Significance flags (based on α = 0.05)
+    FRic_sig_lower = FRic_p_lower < 0.05,
+    FRic_sig_upper = FRic_p_upper < 0.05,
+    FEve_sig = FEve_p_two < 0.05,
+    FDiv_sig = FDiv_p_two < 0.05
+  )
+  
+  cat(sprintf("  ✓ %s: %d species, %d valid permutations\n", 
+              current_season, richness, n_valid))
+}
+
+close(pb)  # Close progress bar
+
+# ============================================================================
+# SECTION 5: FINALIZE AND ORGANIZE RESULTS
+# ============================================================================
+
+cat("\n" + strrep("=", 60) + "\n")
+cat("COMPILING FINAL RESULTS\n")
+cat(strrep("=", 60) + "\n\n")
+
+## COMBINE SEASON SUMMARIES --------------------------------------------------
+FD_null_summary <- bind_rows(null_results_list) %>%
+  mutate(
+    Season = factor(Season, levels = season_order)  # Maintain ordering
+  ) %>%
+  arrange(Season)  # Sort by seasonal sequence
+
+## CREATE COMPREHENSIVE SIMULATION DATASET -----------------------------------
+## This object (FD_all_null_values) contains ALL simulated values
+## Useful for visualization and further analysis
+FD_all_null_values <- bind_rows(all_null_values) %>%
+  mutate(
+    Season = factor(Season, levels = season_order),
+    FRic = as.numeric(FRic),
+    FEve = as.numeric(FEve),
+    FDiv = as.numeric(FDiv)
+  ) %>%
+  arrange(Season, Simulation)
+
+## For compatibility with visualization code, also create 'null_data'
+null_data <- FD_all_null_values  # Alias for easy reference
+
+# ============================================================================
+# SECTION 6: SUMMARIZE AND REPORT RESULTS
+# ============================================================================
+
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║                   ANALYSIS COMPLETE                             ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("SUMMARY STATISTICS:\n")
+cat("──────────────────────────────────────────────────────────────\n")
+cat("Seasons analyzed           :", nrow(FD_null_summary), "\n")
+cat("Permutations per season    :", n_perm, "\n")
+cat("Total simulated communities:", nrow(FD_all_null_values), "\n")
+cat("Mean valid permutations    :", 
+    round(mean(FD_null_summary$N_valid_perm), 1), 
+    "±", round(sd(FD_null_summary$N_valid_perm), 1), "\n")
+cat("Species richness range     :", 
+    min(FD_null_summary$Richness), "-", 
+    max(FD_null_summary$Richness), "\n\n")
+
+cat("SIGNIFICANCE SUMMARY (α = 0.05):\n")
+cat("──────────────────────────────────────────────────────────────\n")
+cat("FRic lower (less than random):", 
+    sum(FD_null_summary$FRic_sig_lower), "/", nrow(FD_null_summary), "seasons\n")
+cat("FRic upper (more than random):", 
+    sum(FD_null_summary$FRic_sig_upper), "/", nrow(FD_null_summary), "seasons\n")
+cat("FEve significant            :", 
+    sum(FD_null_summary$FEve_sig), "/", nrow(FD_null_summary), "seasons\n")
+cat("FDiv significant            :", 
+    sum(FD_null_summary$FDiv_sig), "/", nrow(FD_null_summary), "seasons\n\n")
+
+cat("OUTPUT OBJECTS CREATED:\n")
+cat("──────────────────────────────────────────────────────────────\n")
+cat("1. FD_null_summary    : Data frame with summary statistics\n")
+cat("   - Dimensions:", dim(FD_null_summary)[1], "rows ×", 
+    dim(FD_null_summary)[2], "columns\n")
+cat("   - Contains: SES scores, p-values, significance flags\n\n")
+
+cat("2. FD_all_null_values : Data frame with all simulated values\n")
+cat("   - Dimensions:", dim(FD_all_null_values)[1], "rows ×", 
+    dim(FD_all_null_values)[2], "columns\n")
+cat("   - Contains: All", n_perm, "permutations per season\n")
+cat("   - Also available as 'null_data' for compatibility\n\n")
+
+cat("3. null_data          : Alias for FD_all_null_values\n")
+cat("   - For use in visualization scripts\n\n")
+
+cat("✓ Analysis completed successfully at", format(Sys.time(), "%H:%M:%S"), "\n")
+
+# ============================================================================
+# SECTION 7: OPTIONAL - QUICK DIAGNOSTIC VISUALIZATION
+# ============================================================================
+
+if (interactive()) {
+  cat("\nGenerating diagnostic plots...\n")
+  
+  # Plot null distributions for each metric
+  plot_list <- list()
+  
+  metrics <- c("FRic", "FEve", "FDiv")
+  for (metric in metrics) {
+    p <- FD_all_null_values %>%
+      ggplot(aes_string(x = metric, fill = "Season")) +
+      geom_density(alpha = 0.6, adjust = 1.5) +
+      geom_vline(data = FD_null_summary, 
+                 aes_string(xintercept = paste0(metric, "_obs"), 
+                           color = "Season"),
+                 linetype = "dashed", linewidth = 1) +
+      facet_wrap(~Season, ncol = 2) +
+      labs(
+        title = paste("Null Distributions of", metric),
+        subtitle = "Dashed lines show observed values",
+        x = metric,
+        y = "Density"
+      ) +
+      theme_minimal() +
+      theme(
+        legend.position = "none",
+        strip.text = element_text(face = "bold")
+      )
+    
+    plot_list[[metric]] <- p
+  }
+  
+  # Combine plots
+  diagnostic_plot <- wrap_plots(plot_list, ncol = 1) +
+    plot_annotation(
+      title = "Null Model Diagnostic Plots",
+      subtitle = paste("Based on", n_perm, "permutations per season"),
+      theme = theme(plot.title = element_text(face = "bold", size = 14))
+    )
+  
+  print(diagnostic_plot)
+  cat("✓ Diagnostic plots generated\n")
+}
+
+# ============================================================================
+# SECTION 8: SAVE RESULTS FOR FUTURE USE
+# ============================================================================
+
+## Save results to RDS files (preserves factor levels and attributes)
+saveRDS(FD_null_summary, "FD_null_summary_results.rds")
+saveRDS(FD_all_null_values, "FD_all_null_values_results.rds")
+
+cat("\nResults saved to:\n")
+cat("  - FD_null_summary_results.rds\n")
+cat("  - FD_all_null_values_results.rds\n\n")
+
+cat(strrep("=", 60) + "\n")
+cat("NULL MODEL ANALYSIS COMPLETE - READY FOR INTERPRETATION\n")
+cat(strrep("=", 60) + "\n")
+
+# STANDARDIZED EFFECT SIZE (SES) INTERPRETATION:
+# SES = (Observed - Null Mean) / Null SD
+# 
+# SES > 0: Observed value higher than random expectation
+# SES < 0: Observed value lower than random expectation
+# |SES| > 1.96: Significant at α = 0.05 (two-tailed)
+# 
+# FRic_SES > 0: Community fills more trait space than random
+# FRic_SES < 0: Community fills less trait space than random
+# FEve_SES > 0: More even abundance distribution in trait space
+# FDiv_SES > 0: Abundant species more peripheral in trait space
+
+# P-VALUE CALCULATION (EXACT PERMUTATION TEST):
+# p = (number of permutations ≥ observed + 1) / (total permutations + 1)
+# 
+# The "+1" implements the "plus-one" rule:
+# - Avoids p = 0 (always possible with finite permutations)
+# - More conservative estimate
+# - Ensures p ∈ [1/(n+1), 1]
+
+# THREE MAIN OUTPUTS:
+# 1. FD_null_summary: Statistical results table
+#    - SES scores, p-values, significance flags
+#    - Use for hypothesis testing and reporting
+# 
+# 2. FD_all_null_values: Complete simulation data
+#    - All permutations for visualization
+#    - Use for distributional analysis
+# 
+# 3. null_data: Alias for compatibility
+#    - Directly usable in visualization scripts
+
+# ECOLOGICAL INTERPRETATION GUIDE:
+# 
+# FRic significance indicates:
+#   - Upper tail: Environmental filtering or niche complementarity
+#   - Lower tail: Competitive exclusion or dispersal limitation
+# 
+# FEve significance indicates:
+#   - High FEve: Regular spacing of abundances in trait space
+#   - Low FEve: Clumped abundances in trait space
+# 
+# FDiv significance indicates:
+#   - High FDiv: Abundant species at edges of trait space
+#   - Low FDiv: Abundant species near center of trait space
