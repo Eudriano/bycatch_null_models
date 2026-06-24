@@ -1,0 +1,1821 @@
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Reviewer sensitivity analyses
+#
+# Manuscript:
+# "Regional filtering and stochastic assembly shape the functional diversity
+#  of estuarine fish communities"
+#
+# Purpose:
+# This script implements two complementary sensitivity analyses requested by
+# the reviewers.
+#
+# Reviewer #1:
+#   Test whether the main inference is robust when observed seasonal species
+#   composition and CPUE are retained, but functional profiles are randomly
+#   reassigned among species.
+#
+# Reviewer #2:
+#   Test whether the main inference depends on the number and composition of
+#   traits used to construct the functional space.
+#
+# Main required objects:
+#   Mat2_use   = community matrix, seasons x species, with CPUE values
+#   coord_use  = PCoA coordinates used in the main FD analysis
+#   FD_all     = observed FD results from the main analysis
+#
+# Additional object required for Reviewer #2:
+#   trait_df   = trait table, with one row per species and one column containing
+#                species names/codes
+#
+# Outputs:
+#   1. FD_sensitivity_trait_shuffle
+#   2. FD_sensitivity_trait_shuffle_summary
+#   3. FD_trait_set_sensitivity
+#   4. FD_trait_set_sensitivity_summary
+#   5. FD_runtime_summary
+#   6. RTF tables
+#   7. PDF/TIFF figures
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#==============================================================================
+# 0. Packages
+#==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(FD)
+library(gt)
+library(ggplot2)
+
+
+# Directory where you want to save
+out_dir <- "C:/Users/eudriano/Documents/efc/R_Stat/2026_Trait_bycatch/2026_Sens_Analysis"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+#==============================================================================
+# 1. User settings
+#==============================================================================
+
+# Number of permutations.
+# Use 999 for the manuscript. Use a smaller value, e.g. 99, only for testing.
+n_perm_sensitivity <- 999
+
+# Reproducibility seed.
+seed_sensitivity <- 123
+
+# Number of PCoA axes used in the main analysis.
+# Keep this consistent with the manuscript.
+pcoa_k <- 4
+
+# Species column in the trait table used for Reviewer #2.
+# Change this if your species column has another name.
+species_col <- "Species"
+
+# If tables_dir or out_dir do not already exist, use the working directory.
+if (!exists("tables_dir")) tables_dir <- getwd()
+if (!exists("out_dir")) out_dir <- getwd()
+
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Season order used in figures and tables.
+season_levels <- c("Autumn", "Winter", "Spring", "Summer")
+
+# Display progress bar during permutations.
+show_progress <- TRUE
+
+# Trait-set scenarios for Reviewer #2.
+# Adjust names only if your final trait names differ.
+trait_sets <- list(
+  full_11 = c(
+    "PWC", "Swim", "GC", "BSh",
+    "MTP", "MD", "SM", "Fec", "TP", "GT", "FC"
+  ),
+  reduced_8 = c(
+    "PWC", "Swim", "GC", "BSh",
+    "MTP", "MD", "SM", "TP"
+  ),
+  core_7 = c(
+    "PWC", "Swim", "BSh",
+    "MTP", "MD", "SM", "TP"
+  ),
+  no_reproductive_7 = c(
+    "PWC", "Swim", "BSh",
+    "MTP", "MD", "TP", "FC"
+  )
+)
+
+#==============================================================================
+# 2. Helper functions
+#==============================================================================
+
+format_elapsed_time <- function(seconds) {
+  
+  seconds <- as.numeric(seconds)
+  
+  if (is.na(seconds)) return(NA_character_)
+  
+  h <- floor(seconds / 3600)
+  m <- floor((seconds %% 3600) / 60)
+  s <- round(seconds %% 60, 2)
+  
+  sprintf("%02d:%02d:%05.2f", h, m, s)
+}
+
+get_fd_theme <- function() {
+  
+  # Uses the manuscript/custom theme if available.
+  # Otherwise, falls back to a clean default ggplot theme.
+  
+  if (exists("FD_theme2", mode = "function")) {
+    FD_theme2()
+  } else {
+    ggplot2::theme_bw()
+  }
+}
+
+check_fd_inputs <- function(Mat2_use, coord_use) {
+  
+  if (is.null(rownames(Mat2_use))) {
+    stop("Mat2_use must have season names as row names.")
+  }
+  
+  if (is.null(colnames(Mat2_use))) {
+    stop("Mat2_use must have species names as column names.")
+  }
+  
+  if (is.null(rownames(coord_use))) {
+    stop("coord_use must have species names as row names.")
+  }
+  
+  missing_coords <- setdiff(colnames(Mat2_use), rownames(coord_use))
+  
+  if (length(missing_coords) > 0) {
+    stop(
+      "The following species occur in Mat2_use but are absent from coord_use: ",
+      paste(missing_coords, collapse = ", ")
+    )
+  }
+  
+  invisible(TRUE)
+}
+
+#==============================================================================
+# 3. FD calculation for one assemblage
+#==============================================================================
+
+compute_fd_one_assemblage <- function(abund_vec_named, coords_mat) {
+  
+  # This function computes FRic, FEve, and FDiv for a single assemblage.
+  #
+  # Important:
+  # FRic in a k-dimensional space requires at least k + 1 species. Therefore,
+  # in a 4D functional space, at least five species are required.
+  
+  abund_vec_named <- abund_vec_named[abund_vec_named > 0]
+  
+  sp_use <- intersect(names(abund_vec_named), rownames(coords_mat))
+  
+  if (length(sp_use) == 0) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  abund_use <- abund_vec_named[sp_use]
+  coords_sub <- coords_mat[sp_use, , drop = FALSE]
+  
+  if (length(sp_use) <= ncol(coords_sub)) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  comm <- matrix(
+    abund_use,
+    nrow = 1,
+    dimnames = list("assemblage", sp_use)
+  )
+  
+  fd_res <- tryCatch(
+    FD::dbFD(
+      x          = coords_sub,
+      a          = comm,
+      calc.FRic  = TRUE,
+      stand.x    = FALSE,
+      corr       = "none",
+      m          = ncol(coords_sub),
+      w.abun     = TRUE,
+      messages   = FALSE
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fd_res)) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  c(
+    FRic = as.numeric(fd_res$FRic["assemblage"]),
+    FEve = as.numeric(fd_res$FEve["assemblage"]),
+    FDiv = as.numeric(fd_res$FDiv["assemblage"])
+  )
+}
+
+#==============================================================================
+# 4. Observed FD table
+#==============================================================================
+
+compute_observed_fd_table <- function(Mat2_use, coord_use) {
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  coord_use <- as.matrix(coord_use)
+  
+  storage.mode(Mat2_use) <- "numeric"
+  storage.mode(coord_use) <- "numeric"
+  
+  check_fd_inputs(Mat2_use, coord_use)
+  
+  obs_list <- lapply(rownames(Mat2_use), function(seas) {
+    
+    fd_tmp <- compute_fd_one_assemblage(
+      abund_vec_named = Mat2_use[seas, ],
+      coords_mat = coord_use
+    )
+    
+    data.frame(
+      Assemblage = seas,
+      FRic_abs = fd_tmp["FRic"],
+      FEve = fd_tmp["FEve"],
+      FDiv = fd_tmp["FDiv"],
+      row.names = NULL
+    )
+  })
+  
+  dplyr::bind_rows(obs_list)
+}
+
+extract_observed_values <- function(FD_all, assemblage_name) {
+  
+  obs_row <- FD_all %>%
+    dplyr::filter(Assemblage == assemblage_name)
+  
+  if (nrow(obs_row) != 1) {
+    stop("FD_all must contain exactly one row for assemblage: ", assemblage_name)
+  }
+  
+  fric_col <- NULL
+  
+  if ("FRic_abs" %in% names(obs_row)) {
+    fric_col <- "FRic_abs"
+  }
+  
+  if (is.null(fric_col) && "FRic" %in% names(obs_row)) {
+    fric_col <- "FRic"
+  }
+  
+  if (is.null(fric_col)) {
+    stop("FD_all must contain either FRic_abs or FRic.")
+  }
+  
+  c(
+    FRic = as.numeric(obs_row[[fric_col]]),
+    FEve = as.numeric(obs_row$FEve),
+    FDiv = as.numeric(obs_row$FDiv)
+  )
+}
+
+#==============================================================================
+# 5. Null-model summary function
+#==============================================================================
+
+summarise_null_result <- function(obs_value, null_values) {
+  
+  null_values <- null_values[is.finite(null_values)]
+  
+  if (length(null_values) == 0 || !is.finite(obs_value)) {
+    return(data.frame(
+      Observed  = obs_value,
+      Null_mean = NA_real_,
+      Null_sd   = NA_real_,
+      SES       = NA_real_,
+      p_two     = NA_real_,
+      n_valid   = length(null_values)
+    ))
+  }
+  
+  null_mu <- mean(null_values)
+  null_sd <- stats::sd(null_values)
+  
+  SES <- ifelse(
+    is.finite(null_sd) && null_sd > 0,
+    (obs_value - null_mu) / null_sd,
+    NA_real_
+  )
+  
+  # Two-sided permutation p-value centred on the null mean.
+  # The +1 correction avoids zero p-values when permutations are randomly drawn.
+  p_two <- (
+    sum(abs(null_values - null_mu) >= abs(obs_value - null_mu)) + 1
+  ) / (
+    length(null_values) + 1
+  )
+  
+  data.frame(
+    Observed  = obs_value,
+    Null_mean = null_mu,
+    Null_sd   = null_sd,
+    SES       = SES,
+    p_two     = p_two,
+    n_valid   = length(null_values)
+  )
+}
+
+#==============================================================================
+# 6. Reviewer #1: trait-profile shuffle null model
+#==============================================================================
+
+run_trait_profile_shuffle <- function(
+    Mat2_use,
+    coord_use,
+    FD_all = NULL,
+    n_perm = 999,
+    seed = 123,
+    season_levels = c("Autumn", "Winter", "Spring", "Summer"),
+    show_progress = TRUE,
+    progress_label = "Trait-profile shuffle"
+) {
+  
+  start_time <- Sys.time()
+  
+  set.seed(seed)
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  coord_use <- as.matrix(coord_use)
+  
+  storage.mode(Mat2_use) <- "numeric"
+  storage.mode(coord_use) <- "numeric"
+  
+  check_fd_inputs(Mat2_use, coord_use)
+  
+  if (is.null(FD_all)) {
+    FD_all <- compute_observed_fd_table(Mat2_use, coord_use)
+  }
+  
+  seasons <- rownames(Mat2_use)
+  metrics <- c("FRic", "FEve", "FDiv")
+  
+  total_steps <- length(seasons) * n_perm
+  progress_i <- 0
+  
+  if (show_progress) {
+    message("\nRunning: ", progress_label)
+    pb <- utils::txtProgressBar(
+      min = 0,
+      max = total_steps,
+      style = 3
+    )
+    on.exit(close(pb), add = TRUE)
+  } else {
+    pb <- NULL
+  }
+  
+  sensitivity_list <- vector("list", length(seasons))
+  names(sensitivity_list) <- seasons
+  
+  for (s in seq_along(seasons)) {
+    
+    seas <- seasons[s]
+    
+    # Observed CPUE vector for the season.
+    # This is retained exactly as observed.
+    abund_obs <- Mat2_use[seas, ]
+    abund_obs <- abund_obs[abund_obs > 0]
+    
+    # Observed FD values.
+    obs_values <- extract_observed_values(
+      FD_all = FD_all,
+      assemblage_name = seas
+    )
+    
+    sim_values <- matrix(
+      NA_real_,
+      nrow = n_perm,
+      ncol = length(metrics),
+      dimnames = list(NULL, metrics)
+    )
+    
+    for (i in seq_len(n_perm)) {
+      
+      # Core randomization:
+      # Complete functional profiles are shuffled among species.
+      #
+      # This preserves:
+      #   1. observed species composition;
+      #   2. observed seasonal richness;
+      #   3. observed CPUE values;
+      #   4. the empirical shape of the functional-trait space.
+      #
+      # This breaks:
+      #   1. the link between species identity and functional position.
+      #
+      # Complete functional profiles are shuffled instead of individual traits
+      # because independent trait shuffling may create biologically unrealistic
+      # trait combinations.
+      
+      coords_perm <- coord_use[sample(rownames(coord_use)), , drop = FALSE]
+      rownames(coords_perm) <- rownames(coord_use)
+      
+      sim_values[i, ] <- compute_fd_one_assemblage(
+        abund_vec_named = abund_obs,
+        coords_mat = coords_perm
+      )
+      
+      progress_i <- progress_i + 1
+      
+      if (!is.null(pb)) {
+        utils::setTxtProgressBar(pb, progress_i)
+      }
+    }
+    
+    metric_results <- lapply(metrics, function(met) {
+      
+      tmp <- summarise_null_result(
+        obs_value = obs_values[met],
+        null_values = sim_values[, met]
+      )
+      
+      data.frame(
+        Season = seas,
+        Metric = met,
+        tmp,
+        row.names = NULL
+      )
+    })
+    
+    sensitivity_list[[s]] <- dplyr::bind_rows(metric_results)
+  }
+  
+  end_time <- Sys.time()
+  elapsed_seconds <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  sensitivity_results <- dplyr::bind_rows(sensitivity_list) %>%
+    dplyr::mutate(
+      p_adj_Holm = stats::p.adjust(p_two, method = "holm"),
+      Significant = dplyr::case_when(
+        is.na(p_adj_Holm) ~ NA_character_,
+        p_adj_Holm < 0.05 ~ "Yes",
+        TRUE ~ "No"
+      ),
+      Direction = dplyr::case_when(
+        is.na(SES) ~ NA_character_,
+        SES > 0 ~ "Observed > null",
+        SES < 0 ~ "Observed < null",
+        TRUE ~ "Observed = null"
+      ),
+      Season = factor(Season, levels = season_levels)
+    ) %>%
+    dplyr::arrange(Metric, Season)
+  
+  runtime_tbl <- data.frame(
+    Analysis = progress_label,
+    Start_time = start_time,
+    End_time = end_time,
+    Runtime_seconds = elapsed_seconds,
+    Runtime_hms = format_elapsed_time(elapsed_seconds),
+    n_perm = n_perm,
+    n_steps = total_steps
+  )
+  
+  attr(sensitivity_results, "runtime") <- runtime_tbl
+  
+  message(
+    "\nFinished: ", progress_label,
+    " | elapsed time = ", format_elapsed_time(elapsed_seconds)
+  )
+  
+  sensitivity_results
+}
+
+#==============================================================================
+# 7. Reviewer #2: build functional space for alternative trait sets
+#==============================================================================
+
+build_trait_space <- function(
+    trait_df,
+    species_col,
+    traits_use,
+    pcoa_k = 4
+) {
+  
+  missing_traits <- setdiff(traits_use, names(trait_df))
+  
+  if (length(missing_traits) > 0) {
+    stop(
+      "The following traits are absent from trait_df: ",
+      paste(missing_traits, collapse = ", ")
+    )
+  }
+  
+  if (!species_col %in% names(trait_df)) {
+    stop("species_col was not found in trait_df.")
+  }
+  
+  trait_sub <- trait_df %>%
+    dplyr::select(dplyr::all_of(c(species_col, traits_use))) %>%
+    as.data.frame()
+  
+  # Remove incomplete trait rows.
+  incomplete_rows <- !stats::complete.cases(trait_sub)
+  
+  if (any(incomplete_rows)) {
+    warning(
+      "Some species had missing trait values and were removed: ",
+      paste(trait_sub[[species_col]][incomplete_rows], collapse = ", ")
+    )
+    
+    trait_sub <- trait_sub[!incomplete_rows, , drop = FALSE]
+  }
+  
+  trait_mat <- trait_sub[, traits_use, drop = FALSE]
+  rownames(trait_mat) <- trait_sub[[species_col]]
+  
+  # Convert character traits to factors for Gower distance.
+  trait_mat[] <- lapply(trait_mat, function(x) {
+    if (is.character(x)) {
+      as.factor(x)
+    } else {
+      x
+    }
+  })
+  
+  gower_dist <- FD::gowdis(trait_mat)
+  
+  k_use <- min(pcoa_k, nrow(trait_mat) - 1)
+  
+  pcoa_res <- stats::cmdscale(
+    d = gower_dist,
+    eig = TRUE,
+    k = k_use
+  )
+  
+  coord <- as.matrix(pcoa_res$points)
+  colnames(coord) <- paste0("PCoA", seq_len(ncol(coord)))
+  
+  eig <- pcoa_res$eig
+  
+  if (any(eig[seq_len(k_use)] < -1e-8, na.rm = TRUE)) {
+    warning(
+      "At least one selected PCoA axis has a negative eigenvalue. ",
+      "Check whether this differs from the ordination procedure used in the ",
+      "main manuscript analysis."
+    )
+  }
+  
+  list(
+    coord = coord,
+    gower_dist = gower_dist,
+    eig = eig,
+    traits_used = traits_use,
+    n_traits = length(traits_use),
+    n_species = nrow(coord)
+  )
+}
+
+#==============================================================================
+# 8. Reviewer #2: trait-set sensitivity analysis
+#==============================================================================
+
+run_trait_set_sensitivity <- function(
+    trait_df,
+    species_col,
+    trait_sets,
+    Mat2_use,
+    n_perm = 999,
+    seed = 123,
+    pcoa_k = 4,
+    season_levels = c("Autumn", "Winter", "Spring", "Summer"),
+    show_progress = TRUE
+) {
+  
+  start_time_total <- Sys.time()
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  storage.mode(Mat2_use) <- "numeric"
+  
+  scenario_results <- vector("list", length(trait_sets))
+  names(scenario_results) <- names(trait_sets)
+  
+  scenario_runtime <- vector("list", length(trait_sets))
+  names(scenario_runtime) <- names(trait_sets)
+  
+  for (sc in names(trait_sets)) {
+    
+    traits_use <- trait_sets[[sc]]
+    
+    message("\nPreparing trait-set scenario: ", sc)
+    message("Traits used: ", paste(traits_use, collapse = ", "))
+    
+    trait_space <- build_trait_space(
+      trait_df = trait_df,
+      species_col = species_col,
+      traits_use = traits_use,
+      pcoa_k = pcoa_k
+    )
+    
+    coord_tmp <- trait_space$coord
+    
+    sp_common <- intersect(colnames(Mat2_use), rownames(coord_tmp))
+    
+    if (length(sp_common) <= pcoa_k) {
+      stop(
+        "Scenario ", sc, " has too few species shared between Mat2_use and ",
+        "the reconstructed trait space."
+      )
+    }
+    
+    missing_from_traits <- setdiff(colnames(Mat2_use), rownames(coord_tmp))
+    
+    if (length(missing_from_traits) > 0) {
+      warning(
+        "Scenario ", sc, ": the following species were absent from the trait ",
+        "space and were removed from Mat2_use: ",
+        paste(missing_from_traits, collapse = ", ")
+      )
+    }
+    
+    Mat2_tmp <- Mat2_use[, sp_common, drop = FALSE]
+    coord_tmp <- coord_tmp[sp_common, , drop = FALSE]
+    
+    # Observed FD values are recalculated for each trait-set scenario because
+    # changing the traits changes the geometry of the functional space.
+    FD_obs_tmp <- compute_observed_fd_table(
+      Mat2_use = Mat2_tmp,
+      coord_use = coord_tmp
+    )
+    
+    scenario_label <- paste0("Trait-set sensitivity: ", sc)
+    
+    sens_tmp <- run_trait_profile_shuffle(
+      Mat2_use = Mat2_tmp,
+      coord_use = coord_tmp,
+      FD_all = FD_obs_tmp,
+      n_perm = n_perm,
+      seed = seed,
+      season_levels = season_levels,
+      show_progress = show_progress,
+      progress_label = scenario_label
+    ) %>%
+      dplyr::mutate(
+        Scenario = sc,
+        n_traits = trait_space$n_traits,
+        Traits = paste(traits_use, collapse = ", ")
+      )
+    
+    scenario_results[[sc]] <- sens_tmp
+    
+    runtime_tmp <- attr(sens_tmp, "runtime") %>%
+      dplyr::mutate(
+        Scenario = sc,
+        n_traits = trait_space$n_traits,
+        Traits = paste(traits_use, collapse = ", ")
+      )
+    
+    scenario_runtime[[sc]] <- runtime_tmp
+  }
+  
+  end_time_total <- Sys.time()
+  total_elapsed <- as.numeric(
+    difftime(end_time_total, start_time_total, units = "secs")
+  )
+  
+  results <- dplyr::bind_rows(scenario_results)
+  
+  runtime_tbl <- dplyr::bind_rows(scenario_runtime)
+  
+  total_runtime_tbl <- data.frame(
+    Analysis = "Trait-set sensitivity: total",
+    Start_time = start_time_total,
+    End_time = end_time_total,
+    Runtime_seconds = total_elapsed,
+    Runtime_hms = format_elapsed_time(total_elapsed),
+    n_perm = n_perm,
+    n_steps = NA_integer_,
+    Scenario = "Total",
+    n_traits = NA_integer_,
+    Traits = NA_character_
+  )
+  
+  runtime_tbl <- dplyr::bind_rows(runtime_tbl, total_runtime_tbl)
+  
+  attr(results, "runtime") <- runtime_tbl
+  
+  message(
+    "\nFinished trait-set sensitivity analysis",
+    " | total elapsed time = ", format_elapsed_time(total_elapsed)
+  )
+  
+  results
+}
+
+#==============================================================================
+# 9. Run Reviewer #1 analysis
+#==============================================================================
+
+FD_sensitivity_trait_shuffle <- run_trait_profile_shuffle(
+  Mat2_use = Mat2_use,
+  coord_use = coord_use,
+  FD_all = FD_all,
+  n_perm = n_perm_sensitivity,
+  seed = seed_sensitivity,
+  season_levels = season_levels,
+  show_progress = show_progress,
+  progress_label = "Reviewer #1: trait-profile shuffle"
+)
+
+FD_sensitivity_trait_shuffle_summary <- FD_sensitivity_trait_shuffle %>%
+  dplyr::mutate(
+    Observed   = round(Observed, 6),
+    Null_mean  = round(Null_mean, 6),
+    Null_sd    = round(Null_sd, 6),
+    SES        = round(SES, 3),
+    p_two      = round(p_two, 4),
+    p_adj_Holm = round(p_adj_Holm, 4)
+  ) %>%
+  dplyr::arrange(Metric, Season)
+
+FD_sensitivity_trait_shuffle_summary
+
+#==============================================================================
+# 10. Save Reviewer #1 table
+#==============================================================================
+
+FD_sensitivity_trait_shuffle_gt <- FD_sensitivity_trait_shuffle_summary %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title = "Sensitivity analysis using trait-profile shuffle null model",
+    subtitle = "Observed seasonal species composition and CPUE were retained, whereas complete functional profiles were randomly reassigned among species"
+  ) %>%
+  gt::cols_label(
+    Season      = "Season",
+    Metric      = "Metric",
+    Observed    = "Observed",
+    Null_mean   = "Null mean",
+    Null_sd     = "Null SD",
+    SES         = "SES",
+    p_two       = "p-value",
+    n_valid     = "Valid permutations",
+    p_adj_Holm  = "Holm-adjusted p",
+    Significant = "Significant?",
+    Direction   = "Direction"
+  )
+
+FD_sensitivity_trait_shuffle_gt
+
+gt::gtsave(
+  FD_sensitivity_trait_shuffle_gt,
+  filename = file.path(tables_dir, "FD_sensitivity_trait_profile_shuffle.rtf")
+)
+
+#==============================================================================
+# 11. Plot Reviewer #1 SES
+#==============================================================================
+
+plot_sensitivity_SES <- ggplot(
+  FD_sensitivity_trait_shuffle,
+  aes(x = Season, y = SES)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  geom_hline(
+    yintercept = c(-1.96, 1.96),
+    linetype = "dotted",
+    linewidth = 0.4
+  ) +
+  geom_point(size = 3) +
+  geom_line(aes(group = Metric), linewidth = 0.5) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  xlab("Season") +
+  ylab("Standardized effect size (SES)") +
+  get_fd_theme() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+plot_sensitivity_SES
+
+ggsave(
+  filename = file.path(out_dir, "FD_sensitivity_trait_profile_shuffle_SES.pdf"),
+  plot = plot_sensitivity_SES,
+  width = 7,
+  height = 4,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(out_dir, "FD_sensitivity_trait_profile_shuffle_SES.tiff"),
+  plot = plot_sensitivity_SES,
+  width = 7,
+  height = 4,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Reviewer #2: Trait-set sensitivity analysis
+#
+# Objective:
+# Test whether the main null-model inference depends on the number and
+# composition of traits used to construct the functional space.
+#
+# Input object required:
+#   Land_traits
+#
+# Expected structure of Land_traits:
+#   - One row per species
+#   - Species code column: FAO_Code
+#   - Trait columns:
+#       Swim, GC, PWC, BSh, SM, GT, Fec, MTP, MD, TP, FC
+#   - Seasonal CPUE columns:
+#       Autumn, Winter, Spring, Summer
+#
+# Outputs:
+#   FD_trait_set_sensitivity
+#   FD_trait_set_sensitivity_summary
+#   FD_trait_set_sensitivity_gt
+#   plot_trait_set_SES
+#   FD_runtime_summary
+#
+# Files saved:
+#   FD_trait_set_sensitivity.rtf
+#   FD_trait_set_sensitivity_runtime.rtf
+#   FD_trait_set_sensitivity_SES.pdf
+#   FD_trait_set_sensitivity_SES.tiff
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#==============================================================================
+# 0. Packages
+#==============================================================================
+
+library(dplyr)
+library(tidyr)
+library(FD)
+library(gt)
+library(ggplot2)
+
+#==============================================================================
+# 1. User settings
+#==============================================================================
+
+n_perm_sensitivity <- 999
+seed_sensitivity <- 123
+pcoa_k <- 4
+
+species_col <- "FAO_Code"
+
+season_cols <- c("Autumn", "Winter", "Spring", "Summer")
+season_levels <- c("Autumn", "Winter", "Spring", "Summer")
+
+cat_traits <- c("Swim", "GC", "PWC", "BSh")
+cont_traits <- c("SM", "GT", "Fec", "MTP", "MD", "TP", "FC")
+
+trait_cols_full <- c(cat_traits, cont_traits)
+
+show_progress <- TRUE
+
+if (!exists("tables_dir")) tables_dir <- getwd()
+if (!exists("out_dir")) out_dir <- getwd()
+
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+#==============================================================================
+# 2. Trait-set scenarios
+#==============================================================================
+
+trait_sets <- list(
+  
+  # Scenario 1:
+  # Full retained 11-trait matrix.
+  # This corresponds to the main retained trait set after collinearity screening.
+  full_11 = c(
+    "PWC", "Swim", "GC", "BSh",
+    "MTP", "MD", "SM", "Fec", "TP", "GT", "FC"
+  ),
+  
+  # Scenario 2:
+  # Reduced 8-trait matrix.
+  # This excludes fecundity, generation time, and food consumption.
+  reduced_8 = c(
+    "PWC", "Swim", "GC", "BSh",
+    "MTP", "MD", "SM", "TP"
+  ),
+  
+  # Scenario 3:
+  # Seven-trait ecological core.
+  # This retains broad habitat, locomotor, morphological, environmental,
+  # size-related, and trophic dimensions.
+  core_7 = c(
+    "PWC", "Swim", "BSh",
+    "MTP", "MD", "SM", "TP"
+  ),
+  
+  # Scenario 4:
+  # Seven-trait matrix excluding reproductive and maturation-related traits.
+  # This removes reproductive guild, size at maturity, fecundity, and generation time.
+  no_reproductive_7 = c(
+    "PWC", "Swim", "BSh",
+    "MTP", "MD", "TP", "FC"
+  )
+)
+
+#==============================================================================
+# 3. Helper functions
+#==============================================================================
+
+format_elapsed_time <- function(seconds) {
+  
+  seconds <- as.numeric(seconds)
+  
+  if (is.na(seconds)) return(NA_character_)
+  
+  h <- floor(seconds / 3600)
+  m <- floor((seconds %% 3600) / 60)
+  s <- round(seconds %% 60, 2)
+  
+  sprintf("%02d:%02d:%05.2f", h, m, s)
+}
+
+range01 <- function(x) {
+  
+  x <- as.numeric(x)
+  
+  if (all(is.na(x))) {
+    return(x)
+  }
+  
+  x_range <- range(x, na.rm = TRUE)
+  
+  if (diff(x_range) == 0) {
+    return(rep(0, length(x)))
+  }
+  
+  (x - x_range[1]) / (x_range[2] - x_range[1])
+}
+
+get_fd_theme <- function() {
+  
+  if (exists("FD_theme2", mode = "function")) {
+    FD_theme2()
+  } else {
+    ggplot2::theme_bw()
+  }
+}
+
+#==============================================================================
+# 4. Prepare community matrix
+#==============================================================================
+
+prepare_community_matrix <- function(
+    Land_traits,
+    species_col = "FAO_Code",
+    season_cols = c("Autumn", "Winter", "Spring", "Summer"),
+    season_levels = c("Autumn", "Winter", "Spring", "Summer")
+) {
+  
+  missing_cols <- setdiff(c(species_col, season_cols), names(Land_traits))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "The following columns are missing from Land_traits: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  comm_df <- Land_traits %>%
+    dplyr::select(
+      dplyr::all_of(species_col),
+      dplyr::all_of(season_cols)
+    ) %>%
+    dplyr::distinct(.data[[species_col]], .keep_all = TRUE)
+  
+  comm_df <- as.data.frame(comm_df)
+  rownames(comm_df) <- comm_df[[species_col]]
+  comm_df[[species_col]] <- NULL
+  
+  comm_mat <- as.matrix(comm_df)
+  storage.mode(comm_mat) <- "numeric"
+  
+  # Convert species x seasons to seasons x species.
+  Mat2_use <- t(comm_mat)
+  
+  Mat2_use <- Mat2_use[season_levels, , drop = FALSE]
+  
+  # Remove species with zero abundance across all seasons.
+  Mat2_use <- Mat2_use[, colSums(Mat2_use, na.rm = TRUE) > 0, drop = FALSE]
+  
+  Mat2_use[is.na(Mat2_use)] <- 0
+  
+  Mat2_use
+}
+
+Mat2_use <- prepare_community_matrix(
+  Land_traits = Land_traits,
+  species_col = species_col,
+  season_cols = season_cols,
+  season_levels = season_levels
+)
+
+dim(Mat2_use)
+rownames(Mat2_use)[1:4]
+colnames(Mat2_use)[1:10]
+
+#==============================================================================
+# 5. Prepare trait matrix
+#==============================================================================
+
+prepare_trait_matrix <- function(
+    Land_traits,
+    trait_cols,
+    species_col = "FAO_Code",
+    cat_traits,
+    cont_traits,
+    rescale_continuous = FALSE
+) {
+  
+  missing_cols <- setdiff(c(species_col, trait_cols), names(Land_traits))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "The following columns are missing from Land_traits: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  trait_df <- Land_traits %>%
+    dplyr::select(
+      dplyr::all_of(species_col),
+      dplyr::all_of(trait_cols)
+    ) %>%
+    dplyr::distinct(.data[[species_col]], .keep_all = TRUE)
+  
+  trait_df <- as.data.frame(trait_df)
+  rownames(trait_df) <- trait_df[[species_col]]
+  trait_df[[species_col]] <- NULL
+  
+  cat_use <- intersect(cat_traits, trait_cols)
+  cont_use <- intersect(cont_traits, trait_cols)
+  
+  for (cc in cat_use) {
+    trait_df[[cc]] <- factor(trait_df[[cc]])
+  }
+  
+  for (cc in cont_use) {
+    trait_df[[cc]] <- as.numeric(trait_df[[cc]])
+    
+    # In the shown Land_traits object, continuous traits already appear to be
+    # standardized to 0-1. Therefore, rescale_continuous is FALSE by default.
+    # Set TRUE only if raw trait values are used.
+    if (rescale_continuous) {
+      trait_df[[cc]] <- range01(trait_df[[cc]])
+    }
+  }
+  
+  if (any(!stats::complete.cases(trait_df))) {
+    bad_sp <- rownames(trait_df)[!stats::complete.cases(trait_df)]
+    stop(
+      "Missing values in the trait matrix for species: ",
+      paste(bad_sp, collapse = ", ")
+    )
+  }
+  
+  trait_df
+}
+
+trait_df <- prepare_trait_matrix(
+  Land_traits = Land_traits,
+  trait_cols = trait_cols_full,
+  species_col = species_col,
+  cat_traits = cat_traits,
+  cont_traits = cont_traits,
+  rescale_continuous = FALSE
+)
+
+str(trait_df)
+
+# Check whether community species and trait species match.
+species_in_comm <- colnames(Mat2_use)
+species_in_traits <- rownames(trait_df)
+
+missing_traits <- setdiff(species_in_comm, species_in_traits)
+missing_comm <- setdiff(species_in_traits, species_in_comm)
+
+if (length(missing_traits) > 0) {
+  warning(
+    "Species present in Mat2_use but absent from trait_df: ",
+    paste(missing_traits, collapse = ", ")
+  )
+}
+
+if (length(missing_comm) > 0) {
+  message(
+    "Species present in trait_df but absent from Mat2_use: ",
+    paste(missing_comm, collapse = ", ")
+  )
+}
+
+#==============================================================================
+# 6. Build functional space for a trait-set scenario
+#==============================================================================
+
+build_trait_space <- function(
+    trait_df,
+    traits_use,
+    pcoa_k = 4
+) {
+  
+  missing_traits <- setdiff(traits_use, colnames(trait_df))
+  
+  if (length(missing_traits) > 0) {
+    stop(
+      "The following traits are absent from trait_df: ",
+      paste(missing_traits, collapse = ", ")
+    )
+  }
+  
+  trait_mat <- trait_df %>%
+    dplyr::select(dplyr::all_of(traits_use)) %>%
+    as.data.frame()
+  
+  trait_mat[] <- lapply(trait_mat, function(x) {
+    if (is.character(x)) {
+      factor(x)
+    } else {
+      x
+    }
+  })
+  
+  if (any(!stats::complete.cases(trait_mat))) {
+    bad_sp <- rownames(trait_mat)[!stats::complete.cases(trait_mat)]
+    stop(
+      "Missing values in trait matrix for species: ",
+      paste(bad_sp, collapse = ", ")
+    )
+  }
+  
+  gower_dist <- FD::gowdis(trait_mat)
+  
+  k_use <- min(pcoa_k, nrow(trait_mat) - 1)
+  
+  pcoa_res <- stats::cmdscale(
+    d = gower_dist,
+    eig = TRUE,
+    k = k_use
+  )
+  
+  coord <- as.matrix(pcoa_res$points)
+  colnames(coord) <- paste0("PCoA", seq_len(ncol(coord)))
+  
+  eig <- pcoa_res$eig
+  
+  if (any(eig[seq_len(k_use)] < -1e-8, na.rm = TRUE)) {
+    warning(
+      "At least one selected PCoA axis has a negative eigenvalue. ",
+      "Check whether this differs from the ordination procedure used in the ",
+      "main manuscript analysis."
+    )
+  }
+  
+  list(
+    coord = coord,
+    gower_dist = gower_dist,
+    eig = eig,
+    traits_used = traits_use,
+    n_traits = length(traits_use),
+    n_species = nrow(coord)
+  )
+}
+
+#==============================================================================
+# 7. Functional diversity calculation
+#==============================================================================
+
+compute_fd_one_assemblage <- function(abund_vec_named, coords_mat) {
+  
+  abund_vec_named <- abund_vec_named[abund_vec_named > 0]
+  
+  sp_use <- intersect(names(abund_vec_named), rownames(coords_mat))
+  
+  if (length(sp_use) == 0) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  abund_use <- abund_vec_named[sp_use]
+  coords_sub <- coords_mat[sp_use, , drop = FALSE]
+  
+  # FRic in k-dimensional space requires at least k + 1 species.
+  if (length(sp_use) <= ncol(coords_sub)) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  comm <- matrix(
+    abund_use,
+    nrow = 1,
+    dimnames = list("assemblage", sp_use)
+  )
+  
+  fd_res <- tryCatch(
+    FD::dbFD(
+      x          = coords_sub,
+      a          = comm,
+      calc.FRic  = TRUE,
+      stand.x    = FALSE,
+      corr       = "none",
+      m          = ncol(coords_sub),
+      w.abun     = TRUE,
+      messages   = FALSE
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fd_res)) {
+    return(c(FRic = NA_real_, FEve = NA_real_, FDiv = NA_real_))
+  }
+  
+  c(
+    FRic = as.numeric(fd_res$FRic["assemblage"]),
+    FEve = as.numeric(fd_res$FEve["assemblage"]),
+    FDiv = as.numeric(fd_res$FDiv["assemblage"])
+  )
+}
+
+compute_observed_fd_table <- function(Mat2_use, coord_use) {
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  coord_use <- as.matrix(coord_use)
+  
+  storage.mode(Mat2_use) <- "numeric"
+  storage.mode(coord_use) <- "numeric"
+  
+  seasons <- rownames(Mat2_use)
+  
+  obs_list <- lapply(seasons, function(seas) {
+    
+    fd_tmp <- compute_fd_one_assemblage(
+      abund_vec_named = Mat2_use[seas, ],
+      coords_mat = coord_use
+    )
+    
+    data.frame(
+      Assemblage = seas,
+      FRic_abs = fd_tmp["FRic"],
+      FEve = fd_tmp["FEve"],
+      FDiv = fd_tmp["FDiv"],
+      row.names = NULL
+    )
+  })
+  
+  dplyr::bind_rows(obs_list)
+}
+
+extract_observed_values <- function(FD_all, assemblage_name) {
+  
+  obs_row <- FD_all %>%
+    dplyr::filter(Assemblage == assemblage_name)
+  
+  if (nrow(obs_row) != 1) {
+    stop("FD_all must contain exactly one row for assemblage: ", assemblage_name)
+  }
+  
+  c(
+    FRic = as.numeric(obs_row$FRic_abs),
+    FEve = as.numeric(obs_row$FEve),
+    FDiv = as.numeric(obs_row$FDiv)
+  )
+}
+
+#==============================================================================
+# 8. Null-model summary
+#==============================================================================
+
+summarise_null_result <- function(obs_value, null_values) {
+  
+  null_values <- null_values[is.finite(null_values)]
+  
+  if (length(null_values) == 0 || !is.finite(obs_value)) {
+    return(data.frame(
+      Observed  = obs_value,
+      Null_mean = NA_real_,
+      Null_sd   = NA_real_,
+      SES       = NA_real_,
+      p_two     = NA_real_,
+      n_valid   = length(null_values)
+    ))
+  }
+  
+  null_mu <- mean(null_values)
+  null_sd <- stats::sd(null_values)
+  
+  SES <- ifelse(
+    is.finite(null_sd) && null_sd > 0,
+    (obs_value - null_mu) / null_sd,
+    NA_real_
+  )
+  
+  p_two <- (
+    sum(abs(null_values - null_mu) >= abs(obs_value - null_mu)) + 1
+  ) / (
+    length(null_values) + 1
+  )
+  
+  data.frame(
+    Observed  = obs_value,
+    Null_mean = null_mu,
+    Null_sd   = null_sd,
+    SES       = SES,
+    p_two     = p_two,
+    n_valid   = length(null_values)
+  )
+}
+
+#==============================================================================
+# 9. Trait-profile shuffle null model
+#==============================================================================
+
+run_trait_profile_shuffle <- function(
+    Mat2_use,
+    coord_use,
+    FD_all,
+    n_perm = 999,
+    seed = 123,
+    season_levels = c("Autumn", "Winter", "Spring", "Summer"),
+    show_progress = TRUE,
+    progress_label = "Trait-profile shuffle"
+) {
+  
+  start_time <- Sys.time()
+  
+  set.seed(seed)
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  coord_use <- as.matrix(coord_use)
+  
+  storage.mode(Mat2_use) <- "numeric"
+  storage.mode(coord_use) <- "numeric"
+  
+  seasons <- rownames(Mat2_use)
+  metrics <- c("FRic", "FEve", "FDiv")
+  
+  total_steps <- length(seasons) * n_perm
+  progress_i <- 0
+  
+  if (show_progress) {
+    message("\nRunning: ", progress_label)
+    pb <- utils::txtProgressBar(
+      min = 0,
+      max = total_steps,
+      style = 3
+    )
+    on.exit(close(pb), add = TRUE)
+  } else {
+    pb <- NULL
+  }
+  
+  sensitivity_list <- vector("list", length(seasons))
+  names(sensitivity_list) <- seasons
+  
+  for (s in seq_along(seasons)) {
+    
+    seas <- seasons[s]
+    
+    abund_obs <- Mat2_use[seas, ]
+    abund_obs <- abund_obs[abund_obs > 0]
+    
+    obs_values <- extract_observed_values(
+      FD_all = FD_all,
+      assemblage_name = seas
+    )
+    
+    sim_values <- matrix(
+      NA_real_,
+      nrow = n_perm,
+      ncol = length(metrics),
+      dimnames = list(NULL, metrics)
+    )
+    
+    for (i in seq_len(n_perm)) {
+      
+      # Complete functional profiles are randomly reassigned among species.
+      # The observed species composition and CPUE values are retained.
+      coords_perm <- coord_use[sample(rownames(coord_use)), , drop = FALSE]
+      rownames(coords_perm) <- rownames(coord_use)
+      
+      sim_values[i, ] <- compute_fd_one_assemblage(
+        abund_vec_named = abund_obs,
+        coords_mat = coords_perm
+      )
+      
+      progress_i <- progress_i + 1
+      
+      if (!is.null(pb)) {
+        utils::setTxtProgressBar(pb, progress_i)
+      }
+    }
+    
+    metric_results <- lapply(metrics, function(met) {
+      
+      tmp <- summarise_null_result(
+        obs_value = obs_values[met],
+        null_values = sim_values[, met]
+      )
+      
+      data.frame(
+        Season = seas,
+        Metric = met,
+        tmp,
+        row.names = NULL
+      )
+    })
+    
+    sensitivity_list[[s]] <- dplyr::bind_rows(metric_results)
+  }
+  
+  end_time <- Sys.time()
+  elapsed_seconds <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  sensitivity_results <- dplyr::bind_rows(sensitivity_list) %>%
+    dplyr::mutate(
+      p_adj_Holm = stats::p.adjust(p_two, method = "holm"),
+      Significant = dplyr::case_when(
+        is.na(p_adj_Holm) ~ NA_character_,
+        p_adj_Holm < 0.05 ~ "Yes",
+        TRUE ~ "No"
+      ),
+      Direction = dplyr::case_when(
+        is.na(SES) ~ NA_character_,
+        SES > 0 ~ "Observed > null",
+        SES < 0 ~ "Observed < null",
+        TRUE ~ "Observed = null"
+      ),
+      Season = factor(Season, levels = season_levels)
+    ) %>%
+    dplyr::arrange(Metric, Season)
+  
+  runtime_tbl <- data.frame(
+    Analysis = progress_label,
+    Start_time = start_time,
+    End_time = end_time,
+    Runtime_seconds = elapsed_seconds,
+    Runtime_hms = format_elapsed_time(elapsed_seconds),
+    n_perm = n_perm,
+    n_steps = total_steps
+  )
+  
+  attr(sensitivity_results, "runtime") <- runtime_tbl
+  
+  message(
+    "\nFinished: ", progress_label,
+    " | elapsed time = ", format_elapsed_time(elapsed_seconds)
+  )
+  
+  sensitivity_results
+}
+
+#==============================================================================
+# 10. Run Reviewer #2 trait-set sensitivity analysis
+#==============================================================================
+
+run_trait_set_sensitivity <- function(
+    trait_df,
+    trait_sets,
+    Mat2_use,
+    n_perm = 999,
+    seed = 123,
+    pcoa_k = 4,
+    season_levels = c("Autumn", "Winter", "Spring", "Summer"),
+    show_progress = TRUE
+) {
+  
+  start_time_total <- Sys.time()
+  
+  Mat2_use <- as.matrix(Mat2_use)
+  storage.mode(Mat2_use) <- "numeric"
+  
+  scenario_results <- vector("list", length(trait_sets))
+  names(scenario_results) <- names(trait_sets)
+  
+  scenario_runtime <- vector("list", length(trait_sets))
+  names(scenario_runtime) <- names(trait_sets)
+  
+  for (sc in names(trait_sets)) {
+    
+    traits_use <- trait_sets[[sc]]
+    
+    message("\n============================================================")
+    message("Preparing trait-set scenario: ", sc)
+    message("Number of traits: ", length(traits_use))
+    message("Traits used: ", paste(traits_use, collapse = ", "))
+    message("============================================================")
+    
+    trait_space <- build_trait_space(
+      trait_df = trait_df,
+      traits_use = traits_use,
+      pcoa_k = pcoa_k
+    )
+    
+    coord_tmp <- trait_space$coord
+    
+    sp_common <- intersect(colnames(Mat2_use), rownames(coord_tmp))
+    
+    if (length(sp_common) <= pcoa_k) {
+      stop(
+        "Scenario ", sc, " has too few species shared between Mat2_use and ",
+        "the reconstructed trait space."
+      )
+    }
+    
+    missing_from_traits <- setdiff(colnames(Mat2_use), rownames(coord_tmp))
+    
+    if (length(missing_from_traits) > 0) {
+      warning(
+        "Scenario ", sc, ": the following species were absent from the trait ",
+        "space and were removed from Mat2_use: ",
+        paste(missing_from_traits, collapse = ", ")
+      )
+    }
+    
+    Mat2_tmp <- Mat2_use[, sp_common, drop = FALSE]
+    coord_tmp <- coord_tmp[sp_common, , drop = FALSE]
+    
+    FD_obs_tmp <- compute_observed_fd_table(
+      Mat2_use = Mat2_tmp,
+      coord_use = coord_tmp
+    )
+    
+    scenario_label <- paste0("Reviewer #2 trait-set sensitivity: ", sc)
+    
+    sens_tmp <- run_trait_profile_shuffle(
+      Mat2_use = Mat2_tmp,
+      coord_use = coord_tmp,
+      FD_all = FD_obs_tmp,
+      n_perm = n_perm,
+      seed = seed,
+      season_levels = season_levels,
+      show_progress = show_progress,
+      progress_label = scenario_label
+    ) %>%
+      dplyr::mutate(
+        Scenario = sc,
+        n_traits = trait_space$n_traits,
+        Traits = paste(traits_use, collapse = ", ")
+      )
+    
+    scenario_results[[sc]] <- sens_tmp
+    
+    runtime_tmp <- attr(sens_tmp, "runtime") %>%
+      dplyr::mutate(
+        Scenario = sc,
+        n_traits = trait_space$n_traits,
+        Traits = paste(traits_use, collapse = ", ")
+      )
+    
+    scenario_runtime[[sc]] <- runtime_tmp
+  }
+  
+  end_time_total <- Sys.time()
+  total_elapsed <- as.numeric(
+    difftime(end_time_total, start_time_total, units = "secs")
+  )
+  
+  results <- dplyr::bind_rows(scenario_results)
+  runtime_tbl <- dplyr::bind_rows(scenario_runtime)
+  
+  total_runtime_tbl <- data.frame(
+    Analysis = "Reviewer #2 trait-set sensitivity: total",
+    Start_time = start_time_total,
+    End_time = end_time_total,
+    Runtime_seconds = total_elapsed,
+    Runtime_hms = format_elapsed_time(total_elapsed),
+    n_perm = n_perm,
+    n_steps = NA_integer_,
+    Scenario = "Total",
+    n_traits = NA_integer_,
+    Traits = NA_character_
+  )
+  
+  runtime_tbl <- dplyr::bind_rows(runtime_tbl, total_runtime_tbl)
+  
+  attr(results, "runtime") <- runtime_tbl
+  
+  message(
+    "\nFinished Reviewer #2 trait-set sensitivity analysis",
+    " | total elapsed time = ", format_elapsed_time(total_elapsed)
+  )
+  
+  results
+}
+
+FD_trait_set_sensitivity <- run_trait_set_sensitivity(
+  trait_df = trait_df,
+  trait_sets = trait_sets,
+  Mat2_use = Mat2_use,
+  n_perm = n_perm_sensitivity,
+  seed = seed_sensitivity,
+  pcoa_k = pcoa_k,
+  season_levels = season_levels,
+  show_progress = show_progress
+)
+
+#==============================================================================
+# 11. Summarise results
+#==============================================================================
+
+FD_trait_set_sensitivity_summary <- FD_trait_set_sensitivity %>%
+  dplyr::mutate(
+    Observed   = round(Observed, 6),
+    Null_mean  = round(Null_mean, 6),
+    Null_sd    = round(Null_sd, 6),
+    SES        = round(SES, 3),
+    p_two      = round(p_two, 4),
+    p_adj_Holm = round(p_adj_Holm, 4)
+  ) %>%
+  dplyr::select(
+    Scenario,
+    n_traits,
+    Traits,
+    Season,
+    Metric,
+    Observed,
+    Null_mean,
+    Null_sd,
+    SES,
+    p_two,
+    n_valid,
+    p_adj_Holm,
+    Significant,
+    Direction
+  ) %>%
+  dplyr::arrange(Scenario, Metric, Season)
+
+FD_trait_set_sensitivity_summary
+
+FD_trait_set_sensitivity %>%
+  dplyr::count(Scenario, Metric, Significant)
+
+#==============================================================================
+# 12. Save results table
+#==============================================================================
+
+FD_trait_set_sensitivity_gt <- FD_trait_set_sensitivity_summary %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title = "Trait-set sensitivity analysis",
+    subtitle = "Functional diversity null-model results across alternative trait-set scenarios"
+  ) %>%
+  gt::cols_label(
+    Scenario    = "Trait-set scenario",
+    n_traits    = "Number of traits",
+    Traits      = "Traits used",
+    Season      = "Season",
+    Metric      = "Metric",
+    Observed    = "Observed",
+    Null_mean   = "Null mean",
+    Null_sd     = "Null SD",
+    SES         = "SES",
+    p_two       = "p-value",
+    n_valid     = "Valid permutations",
+    p_adj_Holm  = "Holm-adjusted p",
+    Significant = "Significant?",
+    Direction   = "Direction"
+  )
+
+FD_trait_set_sensitivity_gt
+
+gt::gtsave(
+  FD_trait_set_sensitivity_gt,
+  filename = file.path(tables_dir, "FD_trait_set_sensitivity.rtf")
+)
+
+#==============================================================================
+# 13. Save runtime table
+#==============================================================================
+
+FD_runtime_summary <- attr(FD_trait_set_sensitivity, "runtime") %>%
+  dplyr::select(
+    Analysis,
+    Scenario,
+    n_traits,
+    n_perm,
+    n_steps,
+    Runtime_seconds,
+    Runtime_hms,
+    Start_time,
+    End_time,
+    Traits
+  )
+
+FD_runtime_summary
+
+FD_runtime_summary_gt <- FD_runtime_summary %>%
+  gt::gt() %>%
+  gt::tab_header(
+    title = "Running-time summary for Reviewer #2 trait-set sensitivity analysis",
+    subtitle = "Elapsed time calculated from system time before and after each scenario"
+  ) %>%
+  gt::cols_label(
+    Analysis = "Analysis",
+    Scenario = "Scenario",
+    n_traits = "Number of traits",
+    n_perm = "Permutations",
+    n_steps = "Permutation steps",
+    Runtime_seconds = "Runtime seconds",
+    Runtime_hms = "Runtime HH:MM:SS",
+    Start_time = "Start time",
+    End_time = "End time",
+    Traits = "Traits used"
+  )
+
+FD_runtime_summary_gt
+
+gt::gtsave(
+  FD_runtime_summary_gt,
+  filename = file.path(tables_dir, "FD_trait_set_sensitivity_runtime.rtf")
+)
+
+#==============================================================================
+# 14. Plot SES by scenario
+#==============================================================================
+
+plot_trait_set_SES <- ggplot(
+  FD_trait_set_sensitivity,
+  aes(x = Season, y = SES)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  geom_hline(
+    yintercept = c(-1.96, 1.96),
+    linetype = "dotted",
+    linewidth = 0.4
+  ) +
+  geom_point(size = 2.5) +
+  geom_line(aes(group = Metric), linewidth = 0.4) +
+  facet_grid(Metric ~ Scenario, scales = "free_y") +
+  xlab("Season") +
+  ylab("Standardized effect size (SES)") +
+  get_fd_theme() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+plot_trait_set_SES
+
+ggsave(
+  filename = file.path(out_dir, "FD_trait_set_sensitivity_SES.pdf"),
+  plot = plot_trait_set_SES,
+  width = 10,
+  height = 7,
+  units = "in"
+)
+
+ggsave(
+  filename = file.path(out_dir, "FD_trait_set_sensitivity_SES.tiff"),
+  plot = plot_trait_set_SES,
+  width = 10,
+  height = 7,
+  units = "in",
+  dpi = 300,
+  compression = "lzw"
+)
+
+#==============================================================================
+# 15. Interpretation helper
+#==============================================================================
+
+all_trait_set_no <- all(
+  FD_trait_set_sensitivity$Significant == "No",
+  na.rm = TRUE
+)
+
+if (all_trait_set_no) {
+  message(
+    "Reviewer #2 sensitivity result: all trait-set scenarios supported the ",
+    "same qualitative inference after Holm correction. Observed FRic, FEve, ",
+    "and FDiv remained within null expectations across all scenarios."
+  )
+} else {
+  message(
+    "Reviewer #2 sensitivity result: at least one trait-set scenario produced ",
+    "a significant metric-season result. The manuscript conclusion should be ",
+    "softened and the dependence on trait-set composition should be reported."
+  )
+}
+
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# End of Reviewer #2 trait-set sensitivity analysis
+###~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
